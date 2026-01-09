@@ -148,6 +148,20 @@ def load_smtp_config():
         except: pass
     return default
 
+
+def get_smtp_config():
+    """Retourne la config SMTP avec les clés normalisées."""
+    config = load_smtp_config()
+    return {
+        'smtp_host': config.get('host', ''),
+        'smtp_port': config.get('port', 465),
+        'smtp_user': config.get('username', ''),
+        'smtp_password': config.get('password', ''),
+        'smtp_from_name': config.get('from_name', 'KRYSTO'),
+        'use_ssl': config.get('use_ssl', True)
+    }
+
+
 def save_smtp_config(config):
     try:
         with open(SMTP_CONFIG_FILE, 'w') as f:
@@ -3381,6 +3395,7 @@ def init_database():
         quantity_deposited INTEGER DEFAULT 0,
         quantity_sold INTEGER DEFAULT 0,
         quantity_returned INTEGER DEFAULT 0,
+        quantity_invoiced INTEGER DEFAULT 0,
         price_depot REAL,
         discount_percent REAL DEFAULT 0,
         date_deposit TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -3521,6 +3536,50 @@ def init_database():
         FOREIGN KEY (product_id) REFERENCES products(id)
     )''')
     
+    # Table ventes caisse
+    c.execute('''CREATE TABLE IF NOT EXISTS caisse_sales (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER,
+        client_id INTEGER NOT NULL,
+        date_sale TEXT DEFAULT CURRENT_TIMESTAMP,
+        subtotal REAL DEFAULT 0,
+        tgc_amount REAL DEFAULT 0,
+        total REAL DEFAULT 0,
+        payment_method TEXT DEFAULT 'espèces',
+        ticket_z_id INTEGER,
+        notes TEXT,
+        FOREIGN KEY (invoice_id) REFERENCES invoices(id),
+        FOREIGN KEY (client_id) REFERENCES clients(id),
+        FOREIGN KEY (ticket_z_id) REFERENCES tickets_z(id)
+    )''')
+    
+    # Table tickets Z (clôtures de caisse)
+    c.execute('''CREATE TABLE IF NOT EXISTS tickets_z (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        number INTEGER NOT NULL,
+        date_open TEXT NOT NULL,
+        date_close TEXT DEFAULT CURRENT_TIMESTAMP,
+        nb_sales INTEGER DEFAULT 0,
+        total_especes REAL DEFAULT 0,
+        total_carte REAL DEFAULT 0,
+        total_autre REAL DEFAULT 0,
+        total_ht REAL DEFAULT 0,
+        total_tgc REAL DEFAULT 0,
+        total_ttc REAL DEFAULT 0,
+        closed INTEGER DEFAULT 0,
+        objectif_ca REAL DEFAULT 0,
+        notes TEXT
+    )''')
+    
+    # Table journées de caisse (objectifs quotidiens)
+    c.execute('''CREATE TABLE IF NOT EXISTS caisse_journees (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date_journee TEXT UNIQUE NOT NULL,
+        objectif_ca REAL DEFAULT 0,
+        ouvert INTEGER DEFAULT 1,
+        notes TEXT
+    )''')
+    
     # Table interactions CRM
     c.execute('''CREATE TABLE IF NOT EXISTS interactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3639,6 +3698,8 @@ def init_database():
         ("products", "image_url", "TEXT"),
         ("products", "image_url_2", "TEXT"),
         ("products", "image_url_3", "TEXT"),
+        ("products", "prix_particulier", "REAL DEFAULT 0"),  # Prix pour particuliers
+        ("products", "prix_pro", "REAL DEFAULT 0"),  # Prix pour professionnels
         ("depots", "client_id", "INTEGER"),
         ("depot_products", "discount_percent", "REAL DEFAULT 0"),
     ]
@@ -3649,6 +3710,15 @@ def init_database():
             try: c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"); conn.commit()
             except: pass
     
+    # Migration: copier price vers prix_particulier et prix_pro si vides
+    try:
+        c.execute("""UPDATE products SET prix_particulier = price 
+                     WHERE (prix_particulier IS NULL OR prix_particulier = 0) AND price > 0""")
+        c.execute("""UPDATE products SET prix_pro = price 
+                     WHERE (prix_pro IS NULL OR prix_pro = 0) AND price > 0""")
+        conn.commit()
+    except: pass
+    
     # Générer les codes parrainage manquants
     c.execute("SELECT id, name FROM clients WHERE code_parrainage IS NULL OR code_parrainage = ''")
     clients_sans_code = c.fetchall()
@@ -3656,8 +3726,318 @@ def init_database():
         code = generate_parrainage_code(name, client_id)
         c.execute("UPDATE clients SET code_parrainage = ? WHERE id = ?", (code, client_id))
     
+    # Créer le client comptoir par défaut (code 9900) s'il n'existe pas
+    client_comptoir = c.execute("SELECT id FROM clients WHERE code_parrainage = 'COMPTOIR9900'").fetchone()
+    if not client_comptoir:
+        c.execute("""INSERT INTO clients (name, email, phone, client_type, newsletter, code_parrainage, notes)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                  ("Client Comptoir", "", "", "particulier", 0, "COMPTOIR9900",
+                   "Client par défaut pour les ventes au comptoir sans identification"))
+        print("[INIT] Client Comptoir créé (code 9900)")
+    
     conn.commit()
     conn.close()
+
+
+# Code client comptoir
+CLIENT_COMPTOIR_CODE = "COMPTOIR9900"
+
+
+def get_client_comptoir():
+    """Récupère ou crée le client comptoir."""
+    conn = get_connection()
+    client = conn.execute("SELECT * FROM clients WHERE code_parrainage = ?", (CLIENT_COMPTOIR_CODE,)).fetchone()
+    conn.close()
+    return client
+
+
+# ============================================================================
+# FONCTIONS CAISSE - VENTES ET TICKETS Z
+# ============================================================================
+
+def save_caisse_sale(data, invoice_id=None):
+    """Enregistre une vente de caisse."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("""INSERT INTO caisse_sales (invoice_id, client_id, subtotal, tgc_amount, total, payment_method, notes)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
+              (invoice_id, data['client_id'], data['subtotal'], data['tgc_amount'], 
+               data['total'], data['payment_method'], data.get('notes', '')))
+    sale_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return sale_id
+
+
+def get_caisse_sales_today():
+    """Récupère les ventes du jour non clôturées."""
+    conn = get_connection()
+    today = datetime.now().strftime('%Y-%m-%d')
+    sales = conn.execute("""
+        SELECT cs.*, c.name as client_name, i.number as invoice_number
+        FROM caisse_sales cs
+        LEFT JOIN clients c ON cs.client_id = c.id
+        LEFT JOIN invoices i ON cs.invoice_id = i.id
+        WHERE DATE(cs.date_sale) = ? AND cs.ticket_z_id IS NULL
+        ORDER BY cs.date_sale DESC
+    """, (today,)).fetchall()
+    conn.close()
+    return sales
+
+
+def get_caisse_sales_by_period(date_start, date_end=None):
+    """Récupère les ventes sur une période."""
+    conn = get_connection()
+    if date_end is None:
+        date_end = date_start
+    sales = conn.execute("""
+        SELECT cs.*, c.name as client_name, i.number as invoice_number
+        FROM caisse_sales cs
+        LEFT JOIN clients c ON cs.client_id = c.id
+        LEFT JOIN invoices i ON cs.invoice_id = i.id
+        WHERE DATE(cs.date_sale) BETWEEN ? AND ?
+        ORDER BY cs.date_sale DESC
+    """, (date_start, date_end)).fetchall()
+    conn.close()
+    return sales
+
+
+def get_caisse_sales_by_ticket_z(ticket_z_id):
+    """Récupère les ventes d'un ticket Z."""
+    conn = get_connection()
+    sales = conn.execute("""
+        SELECT cs.*, c.name as client_name, i.number as invoice_number
+        FROM caisse_sales cs
+        LEFT JOIN clients c ON cs.client_id = c.id
+        LEFT JOIN invoices i ON cs.invoice_id = i.id
+        WHERE cs.ticket_z_id = ?
+        ORDER BY cs.date_sale ASC
+    """, (ticket_z_id,)).fetchall()
+    conn.close()
+    return sales
+
+
+def get_all_caisse_sales(limit=100):
+    """Récupère toutes les ventes de caisse."""
+    conn = get_connection()
+    sales = conn.execute("""
+        SELECT cs.*, c.name as client_name, i.number as invoice_number, 
+               tz.number as ticket_z_number
+        FROM caisse_sales cs
+        LEFT JOIN clients c ON cs.client_id = c.id
+        LEFT JOIN invoices i ON cs.invoice_id = i.id
+        LEFT JOIN tickets_z tz ON cs.ticket_z_id = tz.id
+        ORDER BY cs.date_sale DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return sales
+
+
+def get_next_ticket_z_number():
+    """Retourne le prochain numéro de ticket Z."""
+    conn = get_connection()
+    result = conn.execute("SELECT MAX(number) FROM tickets_z").fetchone()
+    conn.close()
+    return (result[0] or 0) + 1
+
+
+def create_ticket_z(date_open=None):
+    """Crée un nouveau ticket Z (ouverture de caisse)."""
+    conn = get_connection()
+    c = conn.cursor()
+    number = get_next_ticket_z_number()
+    if date_open is None:
+        date_open = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    c.execute("""INSERT INTO tickets_z (number, date_open, closed) VALUES (?, ?, 0)""",
+              (number, date_open))
+    ticket_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return ticket_id, number
+
+
+def close_ticket_z(notes=""):
+    """Clôture le ticket Z du jour (génère le rapport Z)."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # Récupérer les ventes non clôturées
+    sales = conn.execute("""
+        SELECT id, subtotal, tgc_amount, total, payment_method 
+        FROM caisse_sales WHERE ticket_z_id IS NULL
+    """).fetchall()
+    
+    if not sales:
+        conn.close()
+        return None, "Aucune vente à clôturer"
+    
+    # Calculer les totaux
+    total_especes = 0
+    total_carte = 0
+    total_autre = 0
+    total_ht = 0
+    total_tgc = 0
+    total_ttc = 0
+    
+    sale_ids = []
+    for sale in sales:
+        sale_ids.append(sale['id'])
+        total_ht += sale['subtotal'] or 0
+        total_tgc += sale['tgc_amount'] or 0
+        total_ttc += sale['total'] or 0
+        
+        payment = sale['payment_method'] or 'espèces'
+        if payment == 'espèces':
+            total_especes += sale['total'] or 0
+        elif payment == 'carte':
+            total_carte += sale['total'] or 0
+        else:
+            total_autre += sale['total'] or 0
+    
+    # Trouver la date d'ouverture (première vente)
+    first_sale = conn.execute("""
+        SELECT MIN(date_sale) FROM caisse_sales WHERE ticket_z_id IS NULL
+    """).fetchone()
+    date_open = first_sale[0] if first_sale else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Créer le ticket Z
+    number = get_next_ticket_z_number()
+    c.execute("""INSERT INTO tickets_z 
+                 (number, date_open, nb_sales, total_especes, total_carte, total_autre,
+                  total_ht, total_tgc, total_ttc, closed, notes)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+              (number, date_open, len(sales), total_especes, total_carte, total_autre,
+               total_ht, total_tgc, total_ttc, notes))
+    ticket_id = c.lastrowid
+    
+    # Associer les ventes au ticket Z
+    for sale_id in sale_ids:
+        c.execute("UPDATE caisse_sales SET ticket_z_id = ? WHERE id = ?", (ticket_id, sale_id))
+    
+    conn.commit()
+    conn.close()
+    
+    return ticket_id, {
+        'number': number,
+        'nb_sales': len(sales),
+        'total_especes': total_especes,
+        'total_carte': total_carte,
+        'total_autre': total_autre,
+        'total_ht': total_ht,
+        'total_tgc': total_tgc,
+        'total_ttc': total_ttc
+    }
+
+
+def get_ticket_z(ticket_id):
+    """Récupère un ticket Z par son ID."""
+    conn = get_connection()
+    ticket = conn.execute("SELECT * FROM tickets_z WHERE id = ?", (ticket_id,)).fetchone()
+    conn.close()
+    return ticket
+
+
+def get_all_tickets_z(limit=50):
+    """Récupère tous les tickets Z."""
+    conn = get_connection()
+    tickets = conn.execute("""
+        SELECT * FROM tickets_z WHERE closed = 1 ORDER BY date_close DESC LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return tickets
+
+
+def get_caisse_stats_today():
+    """Statistiques de caisse du jour."""
+    conn = get_connection()
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    stats = {
+        'nb_sales': 0,
+        'total_especes': 0,
+        'total_carte': 0,
+        'total_autre': 0,
+        'total_ttc': 0,
+        'objectif_ca': 0,
+        'progression': 0
+    }
+    
+    result = conn.execute("""
+        SELECT COUNT(*), 
+               SUM(CASE WHEN payment_method = 'espèces' THEN total ELSE 0 END),
+               SUM(CASE WHEN payment_method = 'carte' THEN total ELSE 0 END),
+               SUM(CASE WHEN payment_method = 'autre' THEN total ELSE 0 END),
+               SUM(total)
+        FROM caisse_sales 
+        WHERE DATE(date_sale) = ? AND ticket_z_id IS NULL
+    """, (today,)).fetchone()
+    
+    if result:
+        stats['nb_sales'] = result[0] or 0
+        stats['total_especes'] = result[1] or 0
+        stats['total_carte'] = result[2] or 0
+        stats['total_autre'] = result[3] or 0
+        stats['total_ttc'] = result[4] or 0
+    
+    # Récupérer l'objectif du jour
+    journee = conn.execute("SELECT objectif_ca FROM caisse_journees WHERE date_journee = ?", (today,)).fetchone()
+    if journee and journee['objectif_ca']:
+        stats['objectif_ca'] = journee['objectif_ca']
+        if stats['objectif_ca'] > 0:
+            stats['progression'] = min(100, (stats['total_ttc'] / stats['objectif_ca']) * 100)
+    
+    conn.close()
+    return stats
+
+
+def get_or_create_journee_caisse(date=None):
+    """Récupère ou crée la journée de caisse."""
+    if date is None:
+        date = datetime.now().strftime('%Y-%m-%d')
+    
+    conn = get_connection()
+    journee = conn.execute("SELECT * FROM caisse_journees WHERE date_journee = ?", (date,)).fetchone()
+    
+    if not journee:
+        conn.execute("INSERT INTO caisse_journees (date_journee, objectif_ca) VALUES (?, 0)", (date,))
+        conn.commit()
+        journee = conn.execute("SELECT * FROM caisse_journees WHERE date_journee = ?", (date,)).fetchone()
+    
+    conn.close()
+    return journee
+
+
+def set_objectif_ca(objectif, date=None):
+    """Définit l'objectif CA du jour."""
+    if date is None:
+        date = datetime.now().strftime('%Y-%m-%d')
+    
+    conn = get_connection()
+    
+    # Vérifier si la journée existe
+    journee = conn.execute("SELECT id FROM caisse_journees WHERE date_journee = ?", (date,)).fetchone()
+    
+    if journee:
+        conn.execute("UPDATE caisse_journees SET objectif_ca = ? WHERE date_journee = ?", (objectif, date))
+    else:
+        conn.execute("INSERT INTO caisse_journees (date_journee, objectif_ca) VALUES (?, ?)", (date, objectif))
+    
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_objectif_ca(date=None):
+    """Récupère l'objectif CA du jour."""
+    if date is None:
+        date = datetime.now().strftime('%Y-%m-%d')
+    
+    conn = get_connection()
+    result = conn.execute("SELECT objectif_ca FROM caisse_journees WHERE date_journee = ?", (date,)).fetchone()
+    conn.close()
+    
+    return result['objectif_ca'] if result else 0
 
 
 def generate_parrainage_code(name, client_id):
@@ -4777,16 +5157,22 @@ def save_product(data, product_id=None):
     c = conn.cursor()
     if product_id:
         c.execute("""UPDATE products SET name=?, description=?, category=?, price=?, cost=?, 
-                     stock=?, image_url=?, image_url_2=?, image_url_3=?, active=? WHERE id=?""",
+                     stock=?, image_url=?, image_url_2=?, image_url_3=?, active=?,
+                     prix_particulier=?, prix_pro=? WHERE id=?""",
                   (data['name'], data.get('description'), data.get('category'), data.get('price', 0),
                    data.get('cost', 0), data.get('stock', 0), data.get('image_url'), 
-                   data.get('image_url_2'), data.get('image_url_3'), data.get('active', 1), product_id))
+                   data.get('image_url_2'), data.get('image_url_3'), data.get('active', 1),
+                   data.get('prix_particulier', data.get('price', 0)),
+                   data.get('prix_pro', data.get('price', 0)), product_id))
     else:
-        c.execute("""INSERT INTO products (name, description, category, price, cost, stock, image_url, image_url_2, image_url_3, active)
-                     VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        c.execute("""INSERT INTO products (name, description, category, price, cost, stock, 
+                     image_url, image_url_2, image_url_3, active, prix_particulier, prix_pro)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (data['name'], data.get('description'), data.get('category'), data.get('price', 0),
                    data.get('cost', 0), data.get('stock', 0), data.get('image_url'),
-                   data.get('image_url_2'), data.get('image_url_3'), data.get('active', 1)))
+                   data.get('image_url_2'), data.get('image_url_3'), data.get('active', 1),
+                   data.get('prix_particulier', data.get('price', 0)),
+                   data.get('prix_pro', data.get('price', 0))))
         product_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -4940,10 +5326,105 @@ def get_depot_stats(depot_id):
         SUM(quantity_deposited) as total_deposited,
         SUM(quantity_sold) as total_sold,
         SUM(quantity_returned) as total_returned,
-        SUM(quantity_deposited - quantity_sold - quantity_returned) as in_stock
+        SUM(quantity_deposited - quantity_sold - quantity_returned) as in_stock,
+        SUM(quantity_invoiced) as total_invoiced
         FROM depot_products WHERE depot_id=?""", (depot_id,)).fetchone()
     conn.close()
     return dict(stats) if stats else {}
+
+
+def get_depot_sales_to_invoice(depot_id):
+    """Récupère les ventes du dépôt non encore facturées."""
+    conn = get_connection()
+    products = conn.execute("""
+        SELECT dp.*, p.name as product_name, p.prix_particulier, p.prix_pro
+        FROM depot_products dp
+        JOIN products p ON dp.product_id = p.id
+        WHERE dp.depot_id = ? AND dp.quantity_sold > dp.quantity_invoiced
+    """, (depot_id,)).fetchall()
+    conn.close()
+    return [dict(p) for p in products]
+
+
+def create_depot_invoice(depot_id):
+    """Crée une facture pour les ventes du dépôt non facturées et enregistre dans caisse_sales."""
+    # Récupérer le dépôt et le client
+    depot = get_depot(depot_id)
+    if not depot:
+        return None, "Dépôt non trouvé"
+    
+    depot = dict(depot)
+    client_id = depot['client_id']
+    
+    # Récupérer les ventes non facturées
+    products_to_invoice = get_depot_sales_to_invoice(depot_id)
+    
+    if not products_to_invoice:
+        return None, "Aucune vente à facturer"
+    
+    # Créer les lignes de facture
+    lines = []
+    for p in products_to_invoice:
+        qty_to_invoice = p['quantity_sold'] - (p.get('quantity_invoiced') or 0)
+        if qty_to_invoice > 0:
+            # Utiliser le prix dépôt si défini, sinon prix_pro
+            unit_price = p.get('price_depot') or p.get('prix_pro') or p.get('prix_particulier') or 0
+            discount = p.get('discount_percent') or 0
+            total = unit_price * qty_to_invoice * (1 - discount / 100)
+            
+            lines.append({
+                'product_id': p['product_id'],
+                'description': f"Dépôt-vente: {p['product_name']}",
+                'quantity': qty_to_invoice,
+                'unit_price': unit_price,
+                'discount_percent': discount,
+                'total': total
+            })
+    
+    if not lines:
+        return None, "Aucune ligne à facturer"
+    
+    # Calculer les totaux
+    subtotal = sum(l['total'] for l in lines)
+    tgc_percent = TGC_RATES.get(DEFAULT_TGC_RATE, 11)
+    tgc_amount = subtotal * tgc_percent / 100
+    total = subtotal + tgc_amount
+    
+    # Créer la facture
+    invoice_data = {
+        'client_id': client_id,
+        'tgc_rate': DEFAULT_TGC_RATE,
+        'status': 'payée',
+        'amount_paid': total,
+        'date_paid': datetime.now().strftime('%Y-%m-%d'),
+        'notes': f"Ventes dépôt-vente #{depot_id}"
+    }
+    
+    invoice_id = save_invoice(invoice_data, lines)
+    
+    # Enregistrer dans caisse_sales pour le CA et le ticket Z
+    sale_data = {
+        'client_id': client_id,
+        'subtotal': subtotal,
+        'tgc_amount': tgc_amount,
+        'total': total,
+        'payment_method': 'autre',
+        'notes': f"Dépôt-vente #{depot_id}"
+    }
+    save_caisse_sale(sale_data, invoice_id)
+    
+    # Mettre à jour les quantités facturées
+    conn = get_connection()
+    for p in products_to_invoice:
+        qty_to_invoice = p['quantity_sold'] - (p.get('quantity_invoiced') or 0)
+        conn.execute("""UPDATE depot_products SET quantity_invoiced = quantity_invoiced + ? 
+                       WHERE depot_id = ? AND product_id = ?""",
+                    (qty_to_invoice, depot_id, p['product_id']))
+    conn.commit()
+    conn.close()
+    
+    return invoice_id, {'total': total, 'nb_products': len(lines), 'subtotal': subtotal}
+
 
 # Groupes de clients
 def get_all_client_groups():
@@ -8149,10 +8630,20 @@ class ProductsFrame(ctk.CTkFrame):
                 ctk.CTkLabel(row1, text=category, text_color="#888", 
                              font=("Helvetica", 10)).pack(side="left", padx=5)
             
-            price = p['price'] if 'price' in p.keys() else 0
+            # Prix Particulier et Pro - accès sécurisé pour sqlite3.Row
+            prix_part = (p['prix_particulier'] if 'prix_particulier' in p.keys() and p['prix_particulier'] else None) or (p['price'] if 'price' in p.keys() else 0) or 0
+            prix_pro = (p['prix_pro'] if 'prix_pro' in p.keys() and p['prix_pro'] else None) or (p['price'] if 'price' in p.keys() else 0) or 0
             stock = p['stock'] if 'stock' in p.keys() else 0
-            ctk.CTkLabel(info, text=f"💰 {format_price(price or 0)} | 📦 Stock: {stock or 0}",
-                         text_color="#888", font=("Helvetica", 11)).pack(anchor="w")
+            
+            price_info = ctk.CTkFrame(info, fg_color="transparent")
+            price_info.pack(anchor="w")
+            
+            ctk.CTkLabel(price_info, text=f"👤 Part: {format_price(prix_part)}", 
+                         text_color="#17a2b8", font=("Helvetica", 10)).pack(side="left")
+            ctk.CTkLabel(price_info, text=f"🏢 Pro: {format_price(prix_pro)}", 
+                         text_color="#28a745", font=("Helvetica", 10)).pack(side="left", padx=10)
+            ctk.CTkLabel(price_info, text=f"📦 Stock: {stock or 0}",
+                         text_color="#888", font=("Helvetica", 10)).pack(side="left", padx=10)
             
             btns = ctk.CTkFrame(frame, fg_color="transparent")
             btns.pack(side="right", padx=10)
@@ -8180,7 +8671,7 @@ class ProductDialog(ctk.CTkToplevel):
         self.product = product
         self.on_save = on_save
         self.title("Produit" if not product else "Modifier produit")
-        self.geometry("500x650")
+        self.geometry("550x750")
         self.transient(parent)
         self.grab_set()
         self._create_ui()
@@ -8203,25 +8694,44 @@ class ProductDialog(ctk.CTkToplevel):
         self.cat_entry = ctk.CTkEntry(main, height=35)
         self.cat_entry.pack(fill="x", pady=(0, 10))
         
-        row = ctk.CTkFrame(main, fg_color="transparent")
-        row.pack(fill="x", pady=10)
+        # Section prix avec deux tarifs
+        prix_frame = ctk.CTkFrame(main, fg_color=KRYSTO_DARK, corner_radius=10)
+        prix_frame.pack(fill="x", pady=10)
         
-        col1 = ctk.CTkFrame(row, fg_color="transparent")
+        ctk.CTkLabel(prix_frame, text="💰 Tarification", font=("Helvetica", 12, "bold")).pack(anchor="w", padx=15, pady=10)
+        
+        prix_row = ctk.CTkFrame(prix_frame, fg_color="transparent")
+        prix_row.pack(fill="x", padx=15, pady=(0, 10))
+        
+        col1 = ctk.CTkFrame(prix_row, fg_color="transparent")
         col1.pack(side="left", expand=True)
-        ctk.CTkLabel(col1, text="Prix (XPF)").pack(anchor="w")
-        self.price_entry = ctk.CTkEntry(col1, width=120)
-        self.price_entry.pack(anchor="w")
+        ctk.CTkLabel(col1, text="Prix Particulier (XPF)", text_color="#17a2b8").pack(anchor="w")
+        self.prix_particulier_entry = ctk.CTkEntry(col1, width=130, placeholder_text="0")
+        self.prix_particulier_entry.pack(anchor="w")
         
-        col2 = ctk.CTkFrame(row, fg_color="transparent")
+        col2 = ctk.CTkFrame(prix_row, fg_color="transparent")
         col2.pack(side="left", expand=True)
-        ctk.CTkLabel(col2, text="Coût").pack(anchor="w")
-        self.cost_entry = ctk.CTkEntry(col2, width=120)
+        ctk.CTkLabel(col2, text="Prix Pro (XPF)", text_color="#28a745").pack(anchor="w")
+        self.prix_pro_entry = ctk.CTkEntry(col2, width=130, placeholder_text="0")
+        self.prix_pro_entry.pack(anchor="w")
+        
+        ctk.CTkLabel(prix_frame, text="💡 Le prix s'applique automatiquement selon le type de client", 
+                     text_color="#888", font=("Helvetica", 9)).pack(anchor="w", padx=15, pady=(0, 10))
+        
+        # Coût et Stock
+        row2 = ctk.CTkFrame(main, fg_color="transparent")
+        row2.pack(fill="x", pady=10)
+        
+        col_cost = ctk.CTkFrame(row2, fg_color="transparent")
+        col_cost.pack(side="left", expand=True)
+        ctk.CTkLabel(col_cost, text="Coût d'achat (XPF)").pack(anchor="w")
+        self.cost_entry = ctk.CTkEntry(col_cost, width=120)
         self.cost_entry.pack(anchor="w")
         
-        col3 = ctk.CTkFrame(row, fg_color="transparent")
-        col3.pack(side="left", expand=True)
-        ctk.CTkLabel(col3, text="Stock").pack(anchor="w")
-        self.stock_entry = ctk.CTkEntry(col3, width=80)
+        col_stock = ctk.CTkFrame(row2, fg_color="transparent")
+        col_stock.pack(side="left", expand=True)
+        ctk.CTkLabel(col_stock, text="Stock").pack(anchor="w")
+        self.stock_entry = ctk.CTkEntry(col_stock, width=80)
         self.stock_entry.pack(anchor="w")
         
         # Section images
@@ -8250,7 +8760,13 @@ class ProductDialog(ctk.CTkToplevel):
             self.name_entry.insert(0, p['name'] if 'name' in p.keys() else '')
             self.desc_entry.insert("1.0", p['description'] if 'description' in p.keys() and p['description'] else '')
             self.cat_entry.insert(0, p['category'] if 'category' in p.keys() and p['category'] else '')
-            self.price_entry.insert(0, str(p['price'] if 'price' in p.keys() else 0))
+            
+            # Prix - utiliser les nouveaux champs ou fallback sur price
+            prix_part = (p['prix_particulier'] if 'prix_particulier' in p.keys() and p['prix_particulier'] else None) or (p['price'] if 'price' in p.keys() else 0) or 0
+            prix_pro = (p['prix_pro'] if 'prix_pro' in p.keys() and p['prix_pro'] else None) or (p['price'] if 'price' in p.keys() else 0) or 0
+            self.prix_particulier_entry.insert(0, str(int(prix_part)))
+            self.prix_pro_entry.insert(0, str(int(prix_pro)))
+            
             self.cost_entry.insert(0, str(p['cost'] if 'cost' in p.keys() else 0))
             self.stock_entry.insert(0, str(p['stock'] if 'stock' in p.keys() else 0))
             self.image_url_entry.insert(0, p['image_url'] if 'image_url' in p.keys() and p['image_url'] else '')
@@ -8269,11 +8785,19 @@ class ProductDialog(ctk.CTkToplevel):
             messagebox.showwarning("Attention", "Le nom est obligatoire")
             return
         
+        prix_particulier = float(self.prix_particulier_entry.get() or 0)
+        prix_pro = float(self.prix_pro_entry.get() or 0)
+        
         data = {
-            'name': name, 'description': self.desc_entry.get("1.0", "end-1c").strip(),
+            'name': name, 
+            'description': self.desc_entry.get("1.0", "end-1c").strip(),
             'category': self.cat_entry.get().strip(),
-            'price': float(self.price_entry.get() or 0), 'cost': float(self.cost_entry.get() or 0),
-            'stock': int(self.stock_entry.get() or 0), 'active': self.active_var.get(),
+            'price': prix_particulier,  # Garder compatibilité avec l'ancien champ
+            'prix_particulier': prix_particulier,
+            'prix_pro': prix_pro,
+            'cost': float(self.cost_entry.get() or 0),
+            'stock': int(self.stock_entry.get() or 0), 
+            'active': self.active_var.get(),
             'image_url': self.image_url_entry.get().strip() or None,
             'image_url_2': self.image_url_2_entry.get().strip() or None,
             'image_url_3': self.image_url_3_entry.get().strip() or None,
@@ -8503,9 +9027,10 @@ class DepotDetailDialog(ctk.CTkToplevel):
     def __init__(self, parent, depot):
         super().__init__(parent)
         self.depot = depot
+        self.parent_frame = parent
         client_name = depot['client_name'] if 'client_name' in depot.keys() else "Dépôt"
         self.title(f"Dépôt: {client_name}")
-        self.geometry("700x550")
+        self.geometry("750x600")
         self.transient(parent)
         self._create_ui()
         self._load_products()
@@ -8521,26 +9046,44 @@ class DepotDetailDialog(ctk.CTkToplevel):
         client_name = self.depot['client_name'] if 'client_name' in self.depot.keys() else "Dépôt"
         ctk.CTkLabel(header, text=f"🏪 {client_name}", font=("Helvetica", 16, "bold")).pack(side="left", padx=15, pady=10)
         
-        ctk.CTkButton(header, text="➕ Déposer produits", fg_color=KRYSTO_PRIMARY,
-                      command=self._add_products).pack(side="right", padx=15, pady=10)
+        # Boutons header
+        btns = ctk.CTkFrame(header, fg_color="transparent")
+        btns.pack(side="right", padx=10, pady=10)
+        
+        ctk.CTkButton(btns, text="💰 Récupérer fonds", fg_color="#28a745", width=140,
+                      command=self._collect_funds).pack(side="left", padx=5)
+        ctk.CTkButton(btns, text="➕ Déposer produits", fg_color=KRYSTO_PRIMARY, width=140,
+                      command=self._add_products).pack(side="left", padx=5)
         
         # Stats
-        stats = get_depot_stats(self.depot['id'])
-        stats_frame = ctk.CTkFrame(main, fg_color=KRYSTO_DARK)
-        stats_frame.pack(fill="x", pady=(0, 10))
-        
-        for label, val, color in [("Déposés", stats.get('total_deposited') or 0, "#888"),
-                                   ("En stock", stats.get('in_stock') or 0, KRYSTO_PRIMARY),
-                                   ("Vendus", stats.get('total_sold') or 0, KRYSTO_SECONDARY),
-                                   ("Retournés", stats.get('total_returned') or 0, "#ff6b6b")]:
-            col = ctk.CTkFrame(stats_frame, fg_color="transparent")
-            col.pack(side="left", expand=True, pady=10)
-            ctk.CTkLabel(col, text=str(int(val)), font=("Helvetica", 20, "bold"), text_color=color).pack()
-            ctk.CTkLabel(col, text=label, font=("Helvetica", 10), text_color="#888").pack()
+        self.stats_frame = ctk.CTkFrame(main, fg_color=KRYSTO_DARK)
+        self.stats_frame.pack(fill="x", pady=(0, 10))
+        self._update_stats()
         
         # Liste produits
         self.products_frame = ctk.CTkScrollableFrame(main, fg_color="#1a1a1a")
         self.products_frame.pack(fill="both", expand=True)
+    
+    def _update_stats(self):
+        """Met à jour les statistiques du dépôt."""
+        for w in self.stats_frame.winfo_children():
+            w.destroy()
+        
+        stats = get_depot_stats(self.depot['id'])
+        
+        sold = int(stats.get('total_sold') or 0)
+        invoiced = int(stats.get('total_invoiced') or 0)
+        to_collect = sold - invoiced
+        
+        for label, val, color in [("Déposés", stats.get('total_deposited') or 0, "#888"),
+                                   ("En stock", stats.get('in_stock') or 0, KRYSTO_PRIMARY),
+                                   ("Vendus", sold, KRYSTO_SECONDARY),
+                                   ("Facturés", invoiced, "#28a745"),
+                                   ("À récupérer", to_collect, "#ff6b6b" if to_collect > 0 else "#888")]:
+            col = ctk.CTkFrame(self.stats_frame, fg_color="transparent")
+            col.pack(side="left", expand=True, pady=10)
+            ctk.CTkLabel(col, text=str(int(val)), font=("Helvetica", 18, "bold"), text_color=color).pack()
+            ctk.CTkLabel(col, text=label, font=("Helvetica", 10), text_color="#888").pack()
     
     def _load_products(self):
         for w in self.products_frame.winfo_children(): w.destroy()
@@ -8559,14 +9102,19 @@ class DepotDetailDialog(ctk.CTkToplevel):
             info.pack(side="left", fill="x", expand=True, padx=15, pady=8)
             
             name = dp['product_name'] if 'product_name' in dp.keys() else "Produit"
-            deposited = dp['quantity_deposited'] if 'quantity_deposited' in dp.keys() else 0
-            sold = dp['quantity_sold'] if 'quantity_sold' in dp.keys() else 0
-            returned = dp['quantity_returned'] if 'quantity_returned' in dp.keys() else 0
+            deposited = int(dp['quantity_deposited'] if 'quantity_deposited' in dp.keys() else 0)
+            sold = int(dp['quantity_sold'] if 'quantity_sold' in dp.keys() else 0)
+            returned = int(dp['quantity_returned'] if 'quantity_returned' in dp.keys() else 0)
+            invoiced = int(dp['quantity_invoiced'] if 'quantity_invoiced' in dp.keys() else 0)
             in_stock = deposited - sold - returned
+            to_collect = sold - invoiced
             
             ctk.CTkLabel(info, text=name, font=("Helvetica", 12, "bold")).pack(side="left")
-            ctk.CTkLabel(info, text=f"📦 Stock: {in_stock} | ✅ Vendus: {sold} | ↩️ Retournés: {returned}",
-                         text_color="#888", font=("Helvetica", 10)).pack(side="left", padx=15)
+            
+            stats_text = f"📦 Stock: {in_stock} | ✅ Vendus: {sold}"
+            if to_collect > 0:
+                stats_text += f" | 💰 À facturer: {to_collect}"
+            ctk.CTkLabel(info, text=stats_text, text_color="#888", font=("Helvetica", 10)).pack(side="left", padx=15)
             
             btns = ctk.CTkFrame(frame, fg_color="transparent")
             btns.pack(side="right", padx=10)
@@ -8579,6 +9127,7 @@ class DepotDetailDialog(ctk.CTkToplevel):
     def _add_products(self):
         dialog = AddDepotProductDialog(self, self.depot['id'])
         self.wait_window(dialog)
+        self._update_stats()
         self._load_products()
     
     def _record_sale(self, dp):
@@ -8587,6 +9136,7 @@ class DepotDetailDialog(ctk.CTkToplevel):
             product_id = dp['product_id'] if 'product_id' in dp.keys() else None
             if product_id:
                 record_depot_sale(self.depot['id'], product_id, int(qty))
+                self._update_stats()
                 self._load_products()
     
     def _record_return(self, dp):
@@ -8595,7 +9145,68 @@ class DepotDetailDialog(ctk.CTkToplevel):
             product_id = dp['product_id'] if 'product_id' in dp.keys() else None
             if product_id:
                 record_depot_return(self.depot['id'], product_id, int(qty))
+                self._update_stats()
                 self._load_products()
+    
+    def _collect_funds(self):
+        """Récupère les fonds des ventes et crée une facture."""
+        # Vérifier s'il y a des ventes à facturer
+        products_to_invoice = get_depot_sales_to_invoice(self.depot['id'])
+        
+        if not products_to_invoice:
+            messagebox.showinfo("Information", "Aucune vente à facturer pour ce dépôt.")
+            return
+        
+        # Calculer le total estimé
+        total_qty = 0
+        total_amount = 0
+        for p in products_to_invoice:
+            qty = p['quantity_sold'] - (p.get('quantity_invoiced') or 0)
+            price = p.get('price_depot') or p.get('prix_pro') or p.get('prix_particulier') or 0
+            discount = p.get('discount_percent') or 0
+            total_qty += qty
+            total_amount += price * qty * (1 - discount / 100)
+        
+        # Calculer TGC
+        tgc = total_amount * 0.11
+        total_ttc = total_amount + tgc
+        
+        # Confirmation
+        msg = f"""Créer une facture pour les ventes du dépôt ?
+
+📦 Produits à facturer: {len(products_to_invoice)}
+📊 Quantité totale: {int(total_qty)}
+💰 Montant HT: {format_price(total_amount)}
+📋 TGC (11%): {format_price(tgc)}
+💵 TOTAL TTC: {format_price(total_ttc)}
+
+Cette facture sera enregistrée dans le CA."""
+        
+        if not messagebox.askyesno("Récupérer fonds", msg):
+            return
+        
+        # Créer la facture
+        invoice_id, result = create_depot_invoice(self.depot['id'])
+        
+        if invoice_id is None:
+            messagebox.showerror("Erreur", str(result))
+            return
+        
+        # Récupérer le numéro de facture
+        invoice, _ = get_invoice(invoice_id)
+        invoice_number = invoice['number'] if invoice else f"#{invoice_id}"
+        
+        messagebox.showinfo("Facture créée", 
+            f"""✅ Facture {invoice_number} créée !
+
+💰 Total: {format_price(result['total'])}
+📦 {result['nb_products']} produit(s) facturé(s)
+
+La facture a été enregistrée dans le CA.""")
+        
+        # Rafraîchir l'affichage
+        self._update_stats()
+        self._load_products()
 
 
 class AddDepotProductDialog(ctk.CTkToplevel):
@@ -10787,9 +11398,21 @@ class QuoteEditorDialog(ctk.CTkToplevel):
         self.on_save = on_save
         self.lines = []
         self.title("Devis")
-        self.geometry("800x600")
+        self.geometry("950x700")
         self.transient(parent)
         self.grab_set()
+        
+        # Charger les produits et clients (convertir en dict pour .get())
+        self._products = get_all_products(active_only=True)
+        self._product_map = {p['name']: dict(p) for p in self._products}
+        self._product_names = ["-- Sélectionner un produit --"] + [p['name'] for p in self._products]
+        
+        self._clients = get_all_clients()
+        self._client_map = {c['name']: dict(c) for c in self._clients}
+        self._client_names = [c['name'] for c in self._clients]
+        
+        self._selected_client_type = 'particulier'
+        
         self._create_ui()
         if quote_id: self._load_data()
     
@@ -10797,42 +11420,57 @@ class QuoteEditorDialog(ctk.CTkToplevel):
         main = ctk.CTkFrame(self)
         main.pack(fill="both", expand=True, padx=20, pady=20)
         
-        # Header
+        # Header - Client et TGC
         top = ctk.CTkFrame(main, fg_color="transparent")
         top.pack(fill="x", pady=(0, 15))
         
         ctk.CTkLabel(top, text="Client *").pack(side="left")
-        clients = get_all_clients()
-        client_names = [c['name'] for c in clients]
-        self.client_combo = ctk.CTkComboBox(top, values=client_names if client_names else [""], width=250)
+        self.client_combo = ctk.CTkComboBox(top, values=self._client_names if self._client_names else [""], 
+                                             width=280, command=self._on_client_changed)
         self.client_combo.pack(side="left", padx=10)
-        self._client_map = {c['name']: c['id'] for c in clients}
+        
+        self.client_type_label = ctk.CTkLabel(top, text="", text_color="#888", font=("Helvetica", 10))
+        self.client_type_label.pack(side="left", padx=5)
         
         ctk.CTkLabel(top, text="TGC:").pack(side="left", padx=(30, 5))
-        self.tgc_combo = ctk.CTkComboBox(top, values=list(TGC_RATES.keys()), width=120)
+        self.tgc_combo = ctk.CTkComboBox(top, values=list(TGC_RATES.keys()), width=120,
+                                          command=lambda v: self._update_totals())
         self.tgc_combo.pack(side="left")
         self.tgc_combo.set(DEFAULT_TGC_RATE)
         
-        # Lignes
-        ctk.CTkLabel(main, text="Lignes du devis", font=("Helvetica", 12, "bold")).pack(anchor="w")
+        # En-tête des colonnes
+        header_frame = ctk.CTkFrame(main, fg_color=KRYSTO_DARK, corner_radius=5)
+        header_frame.pack(fill="x", pady=(10, 2))
         
-        self.lines_frame = ctk.CTkScrollableFrame(main, height=250, fg_color="#1a1a1a")
-        self.lines_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(header_frame, text="Produit", width=280, font=("Helvetica", 10, "bold")).pack(side="left", padx=5, pady=8)
+        ctk.CTkLabel(header_frame, text="Qté", width=60, font=("Helvetica", 10, "bold")).pack(side="left", padx=5)
+        ctk.CTkLabel(header_frame, text="Prix unit.", width=100, font=("Helvetica", 10, "bold")).pack(side="left", padx=5)
+        ctk.CTkLabel(header_frame, text="Remise %", width=70, font=("Helvetica", 10, "bold")).pack(side="left", padx=5)
+        ctk.CTkLabel(header_frame, text="Total ligne", width=100, font=("Helvetica", 10, "bold")).pack(side="left", padx=5)
+        
+        # Lignes
+        self.lines_frame = ctk.CTkScrollableFrame(main, height=280, fg_color="#1a1a1a")
+        self.lines_frame.pack(fill="x", pady=5)
         
         add_btn = ctk.CTkButton(main, text="➕ Ajouter une ligne", fg_color=KRYSTO_SECONDARY, 
                                  text_color=KRYSTO_DARK, command=self._add_line)
-        add_btn.pack(anchor="w")
+        add_btn.pack(anchor="w", pady=5)
         
         # Totaux
         totals = ctk.CTkFrame(main, fg_color=KRYSTO_DARK, corner_radius=10)
-        totals.pack(fill="x", pady=15)
+        totals.pack(fill="x", pady=10)
         
-        self.subtotal_label = ctk.CTkLabel(totals, text="Sous-total: 0 XPF")
-        self.subtotal_label.pack(anchor="e", padx=20, pady=5)
-        self.tgc_label = ctk.CTkLabel(totals, text="TGC (11%): 0 XPF")
-        self.tgc_label.pack(anchor="e", padx=20)
-        self.total_label = ctk.CTkLabel(totals, text="TOTAL: 0 XPF", font=("Helvetica", 14, "bold"))
-        self.total_label.pack(anchor="e", padx=20, pady=5)
+        totals_inner = ctk.CTkFrame(totals, fg_color="transparent")
+        totals_inner.pack(side="right", padx=20, pady=10)
+        
+        self.subtotal_label = ctk.CTkLabel(totals_inner, text="Sous-total: 0 XPF", font=("Helvetica", 11))
+        self.subtotal_label.pack(anchor="e")
+        self.discount_label = ctk.CTkLabel(totals_inner, text="Remises: -0 XPF", text_color="#f39c12", font=("Helvetica", 11))
+        self.discount_label.pack(anchor="e")
+        self.tgc_label = ctk.CTkLabel(totals_inner, text="TGC (11%): 0 XPF", font=("Helvetica", 11))
+        self.tgc_label.pack(anchor="e")
+        self.total_label = ctk.CTkLabel(totals_inner, text="TOTAL: 0 XPF", font=("Helvetica", 16, "bold"), text_color=KRYSTO_SECONDARY)
+        self.total_label.pack(anchor="e", pady=(5, 0))
         
         # Notes
         ctk.CTkLabel(main, text="Notes").pack(anchor="w")
@@ -10847,53 +11485,139 @@ class QuoteEditorDialog(ctk.CTkToplevel):
         
         self._add_line()  # Ajouter une ligne par défaut
     
-    def _add_line(self, description="", quantity=1, unit_price=0, product_id=None):
-        idx = len(self.lines)
-        
+    def _on_client_changed(self, client_name):
+        """Met à jour le type de client et les prix des lignes."""
+        client = self._client_map.get(client_name)
+        if client:
+            client_type = client.get('client_type', 'particulier')
+            self._selected_client_type = client_type
+            
+            type_label = "👤 Particulier" if client_type == 'particulier' else "🏢 Professionnel"
+            type_color = "#17a2b8" if client_type == 'particulier' else "#28a745"
+            self.client_type_label.configure(text=type_label, text_color=type_color)
+            
+            # Mettre à jour les prix des lignes existantes
+            for line in self.lines:
+                if line['frame'].winfo_exists() and line.get('product_id'):
+                    # Chercher dans _product_map (qui contient des dicts)
+                    product = next((p for p in self._product_map.values() if p['id'] == line['product_id']), None)
+                    if product:
+                        price = self._get_price_for_client_type(product)
+                        line['price'].delete(0, 'end')
+                        line['price'].insert(0, str(int(price)))
+            
+            self._update_totals()
+    
+    def _get_price_for_client_type(self, product):
+        """Retourne le prix selon le type de client."""
+        if self._selected_client_type == 'professionnel':
+            return product.get('prix_pro') or product.get('price') or 0
+        else:
+            return product.get('prix_particulier') or product.get('price') or 0
+    
+    def _add_line(self, description="", quantity=1, unit_price=0, product_id=None, discount=0):
         frame = ctk.CTkFrame(self.lines_frame, fg_color="#2a2a2a")
         frame.pack(fill="x", pady=2)
         
-        desc = ctk.CTkEntry(frame, placeholder_text="Description", width=300)
-        desc.pack(side="left", padx=5, pady=5)
-        desc.insert(0, description)
+        # Sélecteur de produit
+        product_combo = ctk.CTkComboBox(frame, values=self._product_names, width=280)
+        product_combo.pack(side="left", padx=5, pady=5)
         
         qty = ctk.CTkEntry(frame, placeholder_text="Qté", width=60)
         qty.pack(side="left", padx=5)
         qty.insert(0, str(quantity))
         qty.bind("<KeyRelease>", lambda e: self._update_totals())
         
-        price = ctk.CTkEntry(frame, placeholder_text="Prix unit.", width=100)
+        price = ctk.CTkEntry(frame, placeholder_text="Prix", width=100)
         price.pack(side="left", padx=5)
         price.insert(0, str(int(unit_price)))
         price.bind("<KeyRelease>", lambda e: self._update_totals())
         
-        ctk.CTkButton(frame, text="🗑️", width=30, fg_color="#dc3545",
-                      command=lambda f=frame, i=idx: self._remove_line(f, i)).pack(side="right", padx=5)
+        discount_entry = ctk.CTkEntry(frame, placeholder_text="0", width=70)
+        discount_entry.pack(side="left", padx=5)
+        discount_entry.insert(0, str(int(discount)))
+        discount_entry.bind("<KeyRelease>", lambda e: self._update_totals())
         
-        self.lines.append({'frame': frame, 'desc': desc, 'qty': qty, 'price': price, 'product_id': product_id})
+        line_total = ctk.CTkLabel(frame, text="0 XPF", width=100, text_color=KRYSTO_SECONDARY)
+        line_total.pack(side="left", padx=5)
+        
+        ctk.CTkButton(frame, text="🗑️", width=30, fg_color="#dc3545",
+                      command=lambda f=frame: self._remove_line(f)).pack(side="right", padx=5)
+        
+        line_data = {
+            'frame': frame, 
+            'product_combo': product_combo,
+            'qty': qty, 
+            'price': price, 
+            'discount': discount_entry,
+            'line_total': line_total,
+            'product_id': product_id
+        }
+        
+        # Si on a un produit_id (édition), retrouver le produit dans _product_map
+        if product_id:
+            product = next((p for p in self._product_map.values() if p['id'] == product_id), None)
+            if product:
+                product_combo.set(product['name'])
+        elif description:
+            # Chercher si la description correspond à un produit
+            product = self._product_map.get(description)
+            if product:
+                product_combo.set(product['name'])
+                line_data['product_id'] = product['id']
+        
+        # Événement de changement de produit
+        def on_product_selected(choice):
+            if choice != "-- Sélectionner un produit --":
+                product = self._product_map.get(choice)
+                if product:
+                    line_data['product_id'] = product['id']
+                    price_value = self._get_price_for_client_type(product)
+                    price.delete(0, 'end')
+                    price.insert(0, str(int(price_value)))
+                    self._update_totals()
+        
+        product_combo.configure(command=on_product_selected)
+        
+        self.lines.append(line_data)
         self._update_totals()
     
-    def _remove_line(self, frame, idx):
+    def _remove_line(self, frame):
         frame.destroy()
         self.lines = [l for l in self.lines if l['frame'].winfo_exists()]
         self._update_totals()
     
     def _update_totals(self):
-        subtotal = 0
+        subtotal_brut = 0
+        total_discount = 0
+        
         for line in self.lines:
             if not line['frame'].winfo_exists(): continue
             try:
                 qty = float(line['qty'].get() or 0)
                 price = float(line['price'].get() or 0)
-                subtotal += qty * price
-            except: pass
+                discount_percent = float(line['discount'].get() or 0)
+                
+                brut = qty * price
+                discount_amount = brut * discount_percent / 100
+                net = brut - discount_amount
+                
+                subtotal_brut += brut
+                total_discount += discount_amount
+                
+                line['line_total'].configure(text=format_price(net))
+            except: 
+                line['line_total'].configure(text="0 XPF")
+        
+        subtotal_net = subtotal_brut - total_discount
         
         tgc_rate = self.tgc_combo.get()
         tgc_percent = TGC_RATES.get(tgc_rate, 11)
-        tgc_amount = subtotal * tgc_percent / 100
-        total = subtotal + tgc_amount
+        tgc_amount = subtotal_net * tgc_percent / 100
+        total = subtotal_net + tgc_amount
         
-        self.subtotal_label.configure(text=f"Sous-total: {format_price(subtotal)}")
+        self.subtotal_label.configure(text=f"Sous-total: {format_price(subtotal_brut)}")
+        self.discount_label.configure(text=f"Remises: -{format_price(total_discount)}")
         self.tgc_label.configure(text=f"TGC ({tgc_percent}%): {format_price(tgc_amount)}")
         self.total_label.configure(text=f"TOTAL: {format_price(total)}")
     
@@ -10903,6 +11627,7 @@ class QuoteEditorDialog(ctk.CTkToplevel):
         
         if quote['client_name']:
             self.client_combo.set(quote['client_name'])
+            self._on_client_changed(quote['client_name'])
         self.tgc_combo.set(quote['tgc_rate'] or DEFAULT_TGC_RATE)
         self.notes_entry.insert("1.0", quote['notes'] or '')
         
@@ -10912,42 +11637,58 @@ class QuoteEditorDialog(ctk.CTkToplevel):
         self.lines = []
         
         for line in lines:
-            self._add_line(line['description'], line['quantity'], line['unit_price'], line['product_id'])
+            self._add_line(
+                description=line['description'], 
+                quantity=line['quantity'], 
+                unit_price=line['unit_price'], 
+                product_id=line['product_id'],
+                discount=line.get('discount_percent', 0)
+            )
     
     def _save(self):
         client_name = self.client_combo.get()
-        client_id = self._client_map.get(client_name)
+        client = self._client_map.get(client_name)
         
-        if not client_id:
+        if not client:
             messagebox.showwarning("Attention", "Sélectionnez un client")
             return
         
         lines_data = []
         for line in self.lines:
             if not line['frame'].winfo_exists(): continue
-            desc = line['desc'].get().strip()
-            if not desc: continue
+            
+            product_name = line['product_combo'].get()
+            if product_name == "-- Sélectionner un produit --":
+                continue
+            
+            product = self._product_map.get(product_name)
+            if not product:
+                continue
             
             try:
                 qty = float(line['qty'].get() or 1)
                 price = float(line['price'].get() or 0)
+                discount = float(line['discount'].get() or 0)
             except:
-                qty, price = 1, 0
+                qty, price, discount = 1, 0, 0
+            
+            total = qty * price * (1 - discount / 100)
             
             lines_data.append({
-                'description': desc,
+                'description': product['name'],
                 'quantity': qty,
                 'unit_price': price,
-                'total': qty * price,
-                'product_id': line['product_id'],
+                'discount_percent': discount,
+                'total': total,
+                'product_id': product['id'],
             })
         
         if not lines_data:
-            messagebox.showwarning("Attention", "Ajoutez au moins une ligne")
+            messagebox.showwarning("Attention", "Ajoutez au moins une ligne avec un produit")
             return
         
         data = {
-            'client_id': client_id,
+            'client_id': client['id'],
             'tgc_rate': self.tgc_combo.get(),
             'notes': self.notes_entry.get("1.0", "end-1c").strip(),
             'status': 'brouillon',
@@ -10972,6 +11713,7 @@ class InvoiceEditorDialog(QuoteEditorDialog):
         
         if invoice['client_name']:
             self.client_combo.set(invoice['client_name'])
+            self._on_client_changed(invoice['client_name'])
         self.tgc_combo.set(invoice['tgc_rate'] or DEFAULT_TGC_RATE)
         self.notes_entry.insert("1.0", invoice['notes'] or '')
         
@@ -10980,42 +11722,58 @@ class InvoiceEditorDialog(QuoteEditorDialog):
         self.lines = []
         
         for line in lines:
-            self._add_line(line['description'], line['quantity'], line['unit_price'], line['product_id'])
+            self._add_line(
+                description=line['description'],
+                quantity=line['quantity'], 
+                unit_price=line['unit_price'], 
+                product_id=line['product_id'],
+                discount=line.get('discount_percent', 0)
+            )
     
     def _save(self):
         client_name = self.client_combo.get()
-        client_id = self._client_map.get(client_name)
+        client = self._client_map.get(client_name)
         
-        if not client_id:
+        if not client:
             messagebox.showwarning("Attention", "Sélectionnez un client")
             return
         
         lines_data = []
         for line in self.lines:
             if not line['frame'].winfo_exists(): continue
-            desc = line['desc'].get().strip()
-            if not desc: continue
+            
+            product_name = line['product_combo'].get()
+            if product_name == "-- Sélectionner un produit --":
+                continue
+            
+            product = self._product_map.get(product_name)
+            if not product:
+                continue
             
             try:
                 qty = float(line['qty'].get() or 1)
                 price = float(line['price'].get() or 0)
+                discount = float(line['discount'].get() or 0)
             except:
-                qty, price = 1, 0
+                qty, price, discount = 1, 0, 0
+            
+            total = qty * price * (1 - discount / 100)
             
             lines_data.append({
-                'description': desc,
+                'description': product['name'],
                 'quantity': qty,
                 'unit_price': price,
-                'total': qty * price,
-                'product_id': line['product_id'],
+                'discount_percent': discount,
+                'total': total,
+                'product_id': product['id'],
             })
         
         if not lines_data:
-            messagebox.showwarning("Attention", "Ajoutez au moins une ligne")
+            messagebox.showwarning("Attention", "Ajoutez au moins une ligne avec un produit")
             return
         
         data = {
-            'client_id': client_id,
+            'client_id': client['id'],
             'tgc_rate': self.tgc_combo.get(),
             'notes': self.notes_entry.get("1.0", "end-1c").strip(),
             'status': 'brouillon',
@@ -11164,6 +11922,1021 @@ def _generate_document_pdf_reportlab(doc, lines, doc_type, number):
     
     doc_pdf.build(story)
     webbrowser.open('file://' + filepath)
+
+
+# ============================================================================
+# CAISSE - POINT DE VENTE
+# ============================================================================
+class CaisseFrame(ctk.CTkFrame):
+    """Interface de caisse / Point de vente avec onglets."""
+    
+    def __init__(self, parent):
+        super().__init__(parent, fg_color="transparent")
+        self.panier = []
+        self.current_client = None
+        self._create_ui()
+        self._reset_sale()
+    
+    def _create_ui(self):
+        # Header principal
+        header = ctk.CTkFrame(self, fg_color=KRYSTO_DARK, corner_radius=10)
+        header.pack(fill="x", padx=10, pady=10)
+        
+        # Ligne 1: Titre et boutons
+        row1 = ctk.CTkFrame(header, fg_color="transparent")
+        row1.pack(fill="x", padx=15, pady=(10, 5))
+        
+        ctk.CTkLabel(row1, text="🛒 Caisse", font=("Helvetica", 22, "bold")).pack(side="left")
+        
+        # Date/heure
+        self.datetime_label = ctk.CTkLabel(row1, text="", text_color="#888")
+        self.datetime_label.pack(side="left", padx=30)
+        self._update_datetime()
+        
+        # Boutons
+        ctk.CTkButton(row1, text="🧾 Clôture Z", fg_color="#6c5ce7", width=110,
+                      command=self._generate_ticket_z).pack(side="right", padx=5)
+        ctk.CTkButton(row1, text="🔄 Nouvelle vente", fg_color="#dc3545", width=130,
+                      command=self._reset_sale).pack(side="right", padx=5)
+        
+        # Ligne 2: Objectif CA et progression
+        row2 = ctk.CTkFrame(header, fg_color="#2a2a2a", corner_radius=8)
+        row2.pack(fill="x", padx=15, pady=(5, 10))
+        
+        # Objectif CA
+        obj_frame = ctk.CTkFrame(row2, fg_color="transparent")
+        obj_frame.pack(side="left", padx=15, pady=10)
+        
+        ctk.CTkLabel(obj_frame, text="🎯 Objectif:", font=("Helvetica", 11)).pack(side="left")
+        
+        self.objectif_entry = ctk.CTkEntry(obj_frame, width=100, height=30, placeholder_text="0")
+        self.objectif_entry.pack(side="left", padx=5)
+        
+        ctk.CTkButton(obj_frame, text="✓", width=30, height=30, fg_color=KRYSTO_PRIMARY,
+                      command=self._save_objectif).pack(side="left", padx=2)
+        
+        # Affichage progression
+        progress_frame = ctk.CTkFrame(row2, fg_color="transparent")
+        progress_frame.pack(side="left", fill="x", expand=True, padx=20, pady=10)
+        
+        self.ca_label = ctk.CTkLabel(progress_frame, text="CA: 0 XPF / 0 XPF", font=("Helvetica", 12, "bold"))
+        self.ca_label.pack(anchor="w")
+        
+        self.progress_bar = ctk.CTkProgressBar(progress_frame, width=400, height=20)
+        self.progress_bar.pack(fill="x", pady=(5, 0))
+        self.progress_bar.set(0)
+        
+        self.progress_label = ctk.CTkLabel(progress_frame, text="0%", font=("Helvetica", 10), text_color=KRYSTO_SECONDARY)
+        self.progress_label.pack(anchor="e")
+        
+        # Stats ventes du jour
+        stats_frame = ctk.CTkFrame(row2, fg_color="transparent")
+        stats_frame.pack(side="right", padx=15, pady=10)
+        
+        self.stats_label = ctk.CTkLabel(stats_frame, text="", font=("Helvetica", 10))
+        self.stats_label.pack()
+        
+        # Onglets
+        self.tabview = ctk.CTkTabview(self, fg_color=KRYSTO_DARK)
+        self.tabview.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        self.tab_vente = self.tabview.add("🛒 Vente")
+        self.tab_historique = self.tabview.add("📋 Historique")
+        self.tab_tickets_z = self.tabview.add("🧾 Tickets Z")
+        
+        self._create_vente_tab()
+        self._create_historique_tab()
+        self._create_tickets_z_tab()
+        
+        # Charger l'objectif du jour
+        self._load_objectif()
+        self._update_stats()
+    
+    def _load_objectif(self):
+        """Charge l'objectif CA du jour."""
+        objectif = get_objectif_ca()
+        self.objectif_entry.delete(0, 'end')
+        if objectif > 0:
+            self.objectif_entry.insert(0, str(int(objectif)))
+    
+    def _save_objectif(self):
+        """Sauvegarde l'objectif CA du jour."""
+        try:
+            objectif = float(self.objectif_entry.get() or 0)
+            set_objectif_ca(objectif)
+            self._update_stats()
+            messagebox.showinfo("Objectif", f"Objectif CA défini: {format_price(objectif)}")
+        except ValueError:
+            messagebox.showwarning("Erreur", "Veuillez entrer un nombre valide")
+    
+    def _create_vente_tab(self):
+        """Crée l'onglet de vente."""
+        main = ctk.CTkFrame(self.tab_vente, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Colonne gauche - Produits et recherche
+        left_col = ctk.CTkFrame(main, fg_color="transparent")
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        
+        # Section Client
+        client_frame = ctk.CTkFrame(left_col, fg_color="#2a2a2a", corner_radius=10)
+        client_frame.pack(fill="x", pady=(0, 10))
+        
+        client_header = ctk.CTkFrame(client_frame, fg_color="transparent")
+        client_header.pack(fill="x", padx=15, pady=10)
+        
+        ctk.CTkLabel(client_header, text="👤 Client", font=("Helvetica", 13, "bold")).pack(side="left")
+        ctk.CTkButton(client_header, text="➕ Nouveau", fg_color=KRYSTO_SECONDARY, 
+                      text_color=KRYSTO_DARK, width=100, height=28,
+                      command=self._create_new_client).pack(side="right")
+        
+        client_select = ctk.CTkFrame(client_frame, fg_color="transparent")
+        client_select.pack(fill="x", padx=15, pady=(0, 10))
+        
+        self._load_clients_list()
+        self.client_combo = ctk.CTkComboBox(client_select, values=self._client_names, width=300,
+                                             command=self._on_client_selected)
+        self.client_combo.pack(side="left")
+        
+        self.client_info_label = ctk.CTkLabel(client_select, text="", text_color="#888", font=("Helvetica", 10))
+        self.client_info_label.pack(side="left", padx=15)
+        
+        # Section Recherche produits
+        search_frame = ctk.CTkFrame(left_col, fg_color="#2a2a2a", corner_radius=10)
+        search_frame.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(search_frame, text="🔍 Ajouter un produit", font=("Helvetica", 13, "bold")).pack(anchor="w", padx=15, pady=10)
+        
+        search_row = ctk.CTkFrame(search_frame, fg_color="transparent")
+        search_row.pack(fill="x", padx=15, pady=(0, 10))
+        
+        self.search_entry = ctk.CTkEntry(search_row, placeholder_text="Rechercher...", width=280, height=38)
+        self.search_entry.pack(side="left")
+        self.search_entry.bind("<KeyRelease>", self._on_search)
+        self.search_entry.bind("<Return>", self._add_first_result)
+        
+        # Liste des produits filtrés
+        self.products_list = ctk.CTkScrollableFrame(left_col, fg_color="#2a2a2a", height=300)
+        self.products_list.pack(fill="both", expand=True)
+        
+        self._load_products()
+        
+        # Colonne droite - Panier et total
+        right_col = ctk.CTkFrame(main, fg_color="#2a2a2a", corner_radius=10, width=380)
+        right_col.pack(side="right", fill="both", padx=(5, 0))
+        right_col.pack_propagate(False)
+        
+        # Header panier
+        panier_header = ctk.CTkFrame(right_col, fg_color="transparent")
+        panier_header.pack(fill="x", padx=15, pady=10)
+        
+        ctk.CTkLabel(panier_header, text="🧾 Panier", font=("Helvetica", 14, "bold")).pack(side="left")
+        self.panier_count = ctk.CTkLabel(panier_header, text="0 article(s)", text_color="#888")
+        self.panier_count.pack(side="right")
+        
+        # Liste panier
+        self.panier_frame = ctk.CTkScrollableFrame(right_col, fg_color="#1a1a1a", height=250)
+        self.panier_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        # Totaux
+        totals_frame = ctk.CTkFrame(right_col, fg_color="#1a1a1a", corner_radius=10)
+        totals_frame.pack(fill="x", padx=10, pady=10)
+        
+        self.subtotal_label = ctk.CTkLabel(totals_frame, text="Sous-total: 0 XPF", font=("Helvetica", 12))
+        self.subtotal_label.pack(anchor="e", padx=15, pady=(10, 2))
+        
+        self.tgc_label = ctk.CTkLabel(totals_frame, text="TGC (11%): 0 XPF", font=("Helvetica", 12))
+        self.tgc_label.pack(anchor="e", padx=15, pady=2)
+        
+        self.total_label = ctk.CTkLabel(totals_frame, text="TOTAL: 0 XPF", 
+                                         font=("Helvetica", 20, "bold"), text_color=KRYSTO_SECONDARY)
+        self.total_label.pack(anchor="e", padx=15, pady=(5, 10))
+        
+        # Boutons de paiement
+        payment_frame = ctk.CTkFrame(right_col, fg_color="transparent")
+        payment_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        ctk.CTkButton(payment_frame, text="💵 Espèces", fg_color="#28a745", height=45, width=110,
+                      font=("Helvetica", 12, "bold"), command=lambda: self._finalize_sale("espèces")).pack(side="left", expand=True, padx=2)
+        ctk.CTkButton(payment_frame, text="💳 Carte", fg_color="#17a2b8", height=45, width=110,
+                      font=("Helvetica", 12, "bold"), command=lambda: self._finalize_sale("carte")).pack(side="left", expand=True, padx=2)
+        ctk.CTkButton(payment_frame, text="📱 Autre", fg_color="#6c5ce7", height=45, width=110,
+                      font=("Helvetica", 12, "bold"), command=lambda: self._finalize_sale("autre")).pack(side="left", expand=True, padx=2)
+    
+    def _create_historique_tab(self):
+        """Crée l'onglet historique des ventes."""
+        # Filtres
+        filter_frame = ctk.CTkFrame(self.tab_historique, fg_color="#2a2a2a", corner_radius=10)
+        filter_frame.pack(fill="x", padx=10, pady=10)
+        
+        ctk.CTkLabel(filter_frame, text="📅 Période:", font=("Helvetica", 12)).pack(side="left", padx=15, pady=10)
+        
+        self.date_filter = ctk.CTkComboBox(filter_frame, values=["Aujourd'hui", "Cette semaine", "Ce mois", "Tout"], width=150)
+        self.date_filter.pack(side="left", padx=5)
+        self.date_filter.set("Aujourd'hui")
+        
+        ctk.CTkButton(filter_frame, text="🔄 Actualiser", fg_color=KRYSTO_PRIMARY, width=100,
+                      command=self._load_historique).pack(side="left", padx=10)
+        
+        # Totaux période
+        self.period_stats = ctk.CTkLabel(filter_frame, text="", font=("Helvetica", 11), text_color=KRYSTO_SECONDARY)
+        self.period_stats.pack(side="right", padx=15)
+        
+        # Liste des ventes
+        self.historique_list = ctk.CTkScrollableFrame(self.tab_historique, fg_color="#2a2a2a")
+        self.historique_list.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        self._load_historique()
+    
+    def _create_tickets_z_tab(self):
+        """Crée l'onglet des tickets Z."""
+        # Header
+        header = ctk.CTkFrame(self.tab_tickets_z, fg_color="#2a2a2a", corner_radius=10)
+        header.pack(fill="x", padx=10, pady=10)
+        
+        ctk.CTkLabel(header, text="🧾 Tickets Z - Clôtures de caisse", font=("Helvetica", 14, "bold")).pack(side="left", padx=15, pady=15)
+        
+        ctk.CTkButton(header, text="🔄 Actualiser", fg_color=KRYSTO_PRIMARY, width=100,
+                      command=self._load_tickets_z).pack(side="right", padx=15, pady=10)
+        
+        # Liste des tickets Z
+        self.tickets_z_list = ctk.CTkScrollableFrame(self.tab_tickets_z, fg_color="#2a2a2a")
+        self.tickets_z_list.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        self._load_tickets_z()
+    
+    def _update_stats(self):
+        """Met à jour les statistiques du jour avec progression objectif."""
+        stats = get_caisse_stats_today()
+        
+        # Texte stats
+        text = f"📊 {stats['nb_sales']} vente(s) | 💵 {format_price(stats['total_especes'])} | 💳 {format_price(stats['total_carte'])}"
+        self.stats_label.configure(text=text)
+        
+        # Mise à jour CA et progression
+        objectif = stats['objectif_ca'] or 0
+        total = stats['total_ttc'] or 0
+        progression = stats['progression'] or 0
+        
+        self.ca_label.configure(text=f"CA: {format_price(total)} / {format_price(objectif)}")
+        self.progress_bar.set(progression / 100)
+        
+        # Couleur selon progression
+        if progression >= 100:
+            color = "#28a745"  # Vert
+            emoji = "🎉"
+        elif progression >= 75:
+            color = KRYSTO_SECONDARY  # Jaune
+            emoji = "🔥"
+        elif progression >= 50:
+            color = "#17a2b8"  # Bleu
+            emoji = "📈"
+        else:
+            color = "#888"
+            emoji = "🎯"
+        
+        self.progress_label.configure(text=f"{emoji} {progression:.0f}%", text_color=color)
+    
+    def _update_datetime(self):
+        """Met à jour l'affichage de la date/heure."""
+        self.datetime_label.configure(text=datetime.now().strftime("%d/%m/%Y %H:%M"))
+        self.after(60000, self._update_datetime)  # Mise à jour chaque minute
+    
+    def _load_clients_list(self):
+        """Charge la liste des clients pour le combobox."""
+        clients = get_all_clients()
+        client_comptoir = get_client_comptoir()
+        
+        self._clients = [dict(c) for c in clients]
+        self._client_map = {c['name']: c for c in self._clients}
+        
+        # Mettre Client Comptoir en premier
+        self._client_names = []
+        if client_comptoir:
+            comptoir_name = "🏪 Client Comptoir (vente anonyme)"
+            self._client_names.append(comptoir_name)
+            self._client_map[comptoir_name] = dict(client_comptoir)
+        
+        # Ajouter les autres clients
+        for c in self._clients:
+            if c.get('code_parrainage') != CLIENT_COMPTOIR_CODE:
+                display_name = f"{c['name']}" + (f" ({c['email']})" if c.get('email') else "")
+                self._client_names.append(display_name)
+                self._client_map[display_name] = c
+    
+    def _on_client_selected(self, choice):
+        """Appelé quand un client est sélectionné."""
+        client = self._client_map.get(choice)
+        if client:
+            self.current_client = client
+            
+            # Afficher les infos du client
+            info_parts = []
+            if client.get('email'):
+                info_parts.append(f"📧 {client['email']}")
+            if client.get('phone'):
+                info_parts.append(f"📞 {client['phone']}")
+            if client.get('client_type') == 'professionnel':
+                info_parts.append("🏢 Pro")
+            
+            self.client_info_label.configure(text=" | ".join(info_parts) if info_parts else "Client anonyme")
+    
+    def _create_new_client(self):
+        """Ouvre le dialogue de création de client rapide."""
+        CaisseClientDialog(self, on_save=self._on_new_client_created)
+    
+    def _on_new_client_created(self, client_id):
+        """Appelé après création d'un nouveau client."""
+        self._load_clients_list()
+        
+        # Rafraîchir le combobox
+        self.client_combo.configure(values=self._client_names)
+        
+        # Sélectionner le nouveau client
+        client = get_client(client_id)
+        if client:
+            client_dict = dict(client)
+            display_name = f"{client_dict['name']}" + (f" ({client_dict['email']})" if client_dict.get('email') else "")
+            self.client_combo.set(display_name)
+            self._on_client_selected(display_name)
+    
+    def _load_products(self, search_term=""):
+        """Charge et affiche les produits."""
+        for w in self.products_list.winfo_children():
+            w.destroy()
+        
+        products = get_all_products(active_only=True)
+        
+        # Filtrer si recherche
+        if search_term:
+            search_lower = search_term.lower()
+            products = [p for p in products if search_lower in p['name'].lower() or 
+                        (p['category'] and search_lower in p['category'].lower())]
+        
+        if not products:
+            ctk.CTkLabel(self.products_list, text="Aucun produit trouvé", text_color="#666").pack(pady=20)
+            return
+        
+        self._filtered_products = products
+        
+        for p in products[:20]:  # Limiter à 20 pour la performance
+            self._create_product_button(p)
+    
+    def _create_product_button(self, product):
+        """Crée un bouton produit cliquable."""
+        # Convertir en dict si nécessaire
+        p = dict(product) if not isinstance(product, dict) else product
+        
+        frame = ctk.CTkFrame(self.products_list, fg_color="#2a2a2a", cursor="hand2")
+        frame.pack(fill="x", pady=2, padx=5)
+        frame.bind("<Button-1>", lambda e, prod=p: self._add_to_panier(prod))
+        
+        # Rendre les enfants cliquables aussi
+        info = ctk.CTkFrame(frame, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+        info.bind("<Button-1>", lambda e, prod=p: self._add_to_panier(prod))
+        
+        name_label = ctk.CTkLabel(info, text=p['name'], font=("Helvetica", 12))
+        name_label.pack(anchor="w")
+        name_label.bind("<Button-1>", lambda e, prod=p: self._add_to_panier(prod))
+        
+        # Prix selon type client
+        if self.current_client and self.current_client.get('client_type') == 'professionnel':
+            price = p.get('prix_pro') or p.get('price') or 0
+            price_text = f"🏢 {format_price(price)}"
+        else:
+            price = p.get('prix_particulier') or p.get('price') or 0
+            price_text = f"👤 {format_price(price)}"
+        
+        price_label = ctk.CTkLabel(frame, text=price_text, text_color=KRYSTO_SECONDARY, 
+                                    font=("Helvetica", 11, "bold"))
+        price_label.pack(side="right", padx=15)
+        price_label.bind("<Button-1>", lambda e, prod=p: self._add_to_panier(prod))
+        
+        stock = p.get('stock') or 0
+        stock_label = ctk.CTkLabel(frame, text=f"📦 {stock}", text_color="#888", font=("Helvetica", 10))
+        stock_label.pack(side="right", padx=5)
+        stock_label.bind("<Button-1>", lambda e, prod=p: self._add_to_panier(prod))
+    
+    def _on_search(self, event=None):
+        """Recherche de produits."""
+        search_term = self.search_entry.get().strip()
+        self._load_products(search_term)
+    
+    def _add_first_result(self, event=None):
+        """Ajoute le premier résultat de recherche au panier."""
+        if hasattr(self, '_filtered_products') and self._filtered_products:
+            self._add_to_panier(self._filtered_products[0])
+            self.search_entry.delete(0, 'end')
+            self._load_products()
+    
+    def _add_to_panier(self, product):
+        """Ajoute un produit au panier."""
+        product_dict = dict(product) if not isinstance(product, dict) else product
+        
+        # Vérifier si déjà dans le panier
+        for item in self.panier:
+            if item['product_id'] == product_dict['id']:
+                item['quantity'] += 1
+                self._update_panier_display()
+                return
+        
+        # Prix selon type client
+        if self.current_client and self.current_client.get('client_type') == 'professionnel':
+            price = product_dict.get('prix_pro') or product_dict.get('price') or 0
+        else:
+            price = product_dict.get('prix_particulier') or product_dict.get('price') or 0
+        
+        # Ajouter au panier
+        self.panier.append({
+            'product_id': product_dict['id'],
+            'name': product_dict['name'],
+            'price': price,
+            'quantity': 1
+        })
+        
+        self._update_panier_display()
+    
+    def _update_panier_display(self):
+        """Met à jour l'affichage du panier."""
+        for w in self.panier_frame.winfo_children():
+            w.destroy()
+        
+        if not self.panier:
+            ctk.CTkLabel(self.panier_frame, text="Panier vide", text_color="#666").pack(pady=30)
+            self.panier_count.configure(text="0 article(s)")
+            self._update_totals()
+            return
+        
+        total_items = sum(item['quantity'] for item in self.panier)
+        self.panier_count.configure(text=f"{total_items} article(s)")
+        
+        for i, item in enumerate(self.panier):
+            frame = ctk.CTkFrame(self.panier_frame, fg_color="#2a2a2a")
+            frame.pack(fill="x", pady=2)
+            
+            # Nom du produit
+            ctk.CTkLabel(frame, text=item['name'][:25], font=("Helvetica", 11)).pack(side="left", padx=10, pady=8)
+            
+            # Contrôles quantité
+            qty_frame = ctk.CTkFrame(frame, fg_color="transparent")
+            qty_frame.pack(side="left", padx=5)
+            
+            ctk.CTkButton(qty_frame, text="-", width=25, height=25, fg_color="#dc3545",
+                          command=lambda idx=i: self._change_quantity(idx, -1)).pack(side="left")
+            
+            qty_label = ctk.CTkLabel(qty_frame, text=str(item['quantity']), width=30)
+            qty_label.pack(side="left", padx=5)
+            
+            ctk.CTkButton(qty_frame, text="+", width=25, height=25, fg_color="#28a745",
+                          command=lambda idx=i: self._change_quantity(idx, 1)).pack(side="left")
+            
+            # Prix total ligne
+            line_total = item['price'] * item['quantity']
+            ctk.CTkLabel(frame, text=format_price(line_total), text_color=KRYSTO_SECONDARY,
+                         font=("Helvetica", 11, "bold")).pack(side="right", padx=10)
+            
+            # Bouton supprimer
+            ctk.CTkButton(frame, text="🗑️", width=30, height=25, fg_color="#dc3545",
+                          command=lambda idx=i: self._remove_from_panier(idx)).pack(side="right", padx=2)
+        
+        self._update_totals()
+    
+    def _change_quantity(self, index, delta):
+        """Change la quantité d'un article."""
+        if 0 <= index < len(self.panier):
+            self.panier[index]['quantity'] += delta
+            if self.panier[index]['quantity'] <= 0:
+                self.panier.pop(index)
+            self._update_panier_display()
+    
+    def _remove_from_panier(self, index):
+        """Supprime un article du panier."""
+        if 0 <= index < len(self.panier):
+            self.panier.pop(index)
+            self._update_panier_display()
+    
+    def _update_totals(self):
+        """Met à jour les totaux."""
+        subtotal = sum(item['price'] * item['quantity'] for item in self.panier)
+        tgc_percent = TGC_RATES.get(DEFAULT_TGC_RATE, 11)
+        tgc_amount = subtotal * tgc_percent / 100
+        total = subtotal + tgc_amount
+        
+        self.subtotal_label.configure(text=f"Sous-total: {format_price(subtotal)}")
+        self.tgc_label.configure(text=f"TGC ({tgc_percent}%): {format_price(tgc_amount)}")
+        self.total_label.configure(text=f"TOTAL: {format_price(total)}")
+    
+    def _reset_sale(self):
+        """Réinitialise la vente."""
+        self.panier = []
+        self._load_clients_list()
+        
+        # Mettre Client Comptoir par défaut
+        if self._client_names:
+            self.client_combo.configure(values=self._client_names)
+            self.client_combo.set(self._client_names[0])
+            self._on_client_selected(self._client_names[0])
+        
+        self._update_panier_display()
+        self.search_entry.delete(0, 'end')
+        self._load_products()
+    
+    def _finalize_sale(self, payment_method):
+        """Finalise la vente."""
+        if not self.panier:
+            messagebox.showwarning("Attention", "Le panier est vide!")
+            return
+        
+        if not self.current_client:
+            messagebox.showwarning("Attention", "Sélectionnez un client!")
+            return
+        
+        # Calculer les totaux
+        subtotal = sum(item['price'] * item['quantity'] for item in self.panier)
+        tgc_percent = TGC_RATES.get(DEFAULT_TGC_RATE, 11)
+        tgc_amount = subtotal * tgc_percent / 100
+        total = subtotal + tgc_amount
+        
+        # Créer les lignes de facture
+        lines = []
+        for item in self.panier:
+            lines.append({
+                'product_id': item['product_id'],
+                'description': item['name'],
+                'quantity': item['quantity'],
+                'unit_price': item['price'],
+                'discount_percent': 0,
+                'total': item['price'] * item['quantity']
+            })
+        
+        # Créer la facture
+        invoice_data = {
+            'client_id': self.current_client['id'],
+            'tgc_rate': DEFAULT_TGC_RATE,
+            'status': 'payée',
+            'amount_paid': total,
+            'date_paid': datetime.now().strftime('%Y-%m-%d'),
+            'notes': f"Vente au comptoir - Paiement: {payment_method}"
+        }
+        
+        invoice_id = save_invoice(invoice_data, lines)
+        
+        # Enregistrer dans caisse_sales pour le ticket Z
+        sale_data = {
+            'client_id': self.current_client['id'],
+            'subtotal': subtotal,
+            'tgc_amount': tgc_amount,
+            'total': total,
+            'payment_method': payment_method,
+            'notes': f"Facture liée"
+        }
+        save_caisse_sale(sale_data, invoice_id)
+        
+        # Récupérer le numéro de facture
+        invoice, _ = get_invoice(invoice_id)
+        invoice_number = invoice['number'] if invoice else f"#{invoice_id}"
+        
+        # Demander si envoyer par email (si le client a un email)
+        is_comptoir = self.current_client.get('code_parrainage') == CLIENT_COMPTOIR_CODE
+        has_email = self.current_client.get('email')
+        
+        if has_email and not is_comptoir:
+            send_email = messagebox.askyesno("Email", 
+                f"Envoyer la facture par email à {self.current_client['email']} ?")
+            if send_email:
+                self._send_receipt_email(invoice_id)
+        
+        # Message de confirmation
+        messagebox.showinfo("Vente terminée", 
+            f"✅ Facture {invoice_number} créée!\n\n"
+            f"Total: {format_price(total)}\n"
+            f"Paiement: {payment_method.upper()}\n"
+            f"Client: {self.current_client['name']}")
+        
+        # Mettre à jour stats et historique
+        self._update_stats()
+        self._load_historique()
+        
+        # Réinitialiser pour une nouvelle vente
+        self._reset_sale()
+    
+    def _send_receipt_email(self, invoice_id):
+        """Envoie le reçu par email."""
+        invoice, lines = get_invoice(invoice_id)
+        if not invoice or not invoice['client_email']:
+            return
+        
+        # Construire le contenu de l'email
+        lines_html = ""
+        for line in lines:
+            lines_html += f"<tr><td style='padding:8px;border-bottom:1px solid #eee;'>{line['description']}</td>"
+            lines_html += f"<td style='padding:8px;text-align:center;'>{line['quantity']}</td>"
+            lines_html += f"<td style='padding:8px;text-align:right;'>{format_price(line['total'])}</td></tr>"
+        
+        tgc_percent = TGC_RATES.get(invoice['tgc_rate'], 11)
+        
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+            <div style="text-align:center;margin-bottom:30px;">
+                <h1 style="color:{KRYSTO_PRIMARY};margin:0;">{COMPANY_NAME}</h1>
+                <p style="color:#666;margin:5px 0;">{COMPANY_SLOGAN}</p>
+            </div>
+            
+            <h2 style="color:#333;">Merci pour votre achat! 🎉</h2>
+            
+            <p>Bonjour {invoice['client_name']},</p>
+            <p>Nous vous remercions pour votre achat chez {COMPANY_NAME}.</p>
+            
+            <div style="background:#f9f9f9;padding:20px;border-radius:10px;margin:20px 0;">
+                <h3 style="margin-top:0;">Facture {invoice['number']}</h3>
+                <p>Date: {invoice['date_invoice'][:10] if invoice['date_invoice'] else ''}</p>
+                
+                <table style="width:100%;border-collapse:collapse;margin:15px 0;">
+                    <tr style="background:{KRYSTO_PRIMARY};color:white;">
+                        <th style="padding:10px;text-align:left;">Article</th>
+                        <th style="padding:10px;text-align:center;">Qté</th>
+                        <th style="padding:10px;text-align:right;">Total</th>
+                    </tr>
+                    {lines_html}
+                </table>
+                
+                <div style="text-align:right;margin-top:15px;">
+                    <p>Sous-total: {format_price(invoice['subtotal'])}</p>
+                    <p>TGC ({tgc_percent}%): {format_price(invoice['tgc_amount'])}</p>
+                    <p style="font-size:18px;font-weight:bold;color:{KRYSTO_PRIMARY};">
+                        TOTAL: {format_price(invoice['total'])}
+                    </p>
+                </div>
+            </div>
+            
+            <p>À bientôt chez {COMPANY_NAME}!</p>
+            
+            <div style="margin-top:30px;padding-top:20px;border-top:1px solid #eee;text-align:center;color:#888;">
+                <p>{COMPANY_ADDRESS}</p>
+                <p>{COMPANY_EMAIL} | {COMPANY_PHONE}</p>
+            </div>
+        </div>
+        """
+        
+        try:
+            # Envoyer l'email
+            smtp_config = get_smtp_config()
+            if not smtp_config.get('smtp_host'):
+                print("[CAISSE] Configuration SMTP manquante")
+                return
+            
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = f"Votre facture {invoice['number']} - {COMPANY_NAME}"
+            msg['From'] = smtp_config.get('smtp_user', COMPANY_EMAIL)
+            msg['To'] = invoice['client_email']
+            
+            msg.attach(MIMEText(html, 'html'))
+            
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(smtp_config['smtp_host'], smtp_config.get('smtp_port', 465), context=context) as server:
+                server.login(smtp_config['smtp_user'], smtp_config['smtp_password'])
+                server.send_message(msg)
+            
+            print(f"[CAISSE] Email envoyé à {invoice['client_email']}")
+        except Exception as e:
+            print(f"[CAISSE] Erreur envoi email: {e}")
+    
+    def _load_historique(self):
+        """Charge l'historique des ventes."""
+        for w in self.historique_list.winfo_children():
+            w.destroy()
+        
+        # Déterminer la période
+        period = self.date_filter.get()
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        if period == "Aujourd'hui":
+            sales = get_caisse_sales_by_period(today)
+        elif period == "Cette semaine":
+            week_start = (datetime.now() - timedelta(days=datetime.now().weekday())).strftime('%Y-%m-%d')
+            sales = get_caisse_sales_by_period(week_start, today)
+        elif period == "Ce mois":
+            month_start = datetime.now().replace(day=1).strftime('%Y-%m-%d')
+            sales = get_caisse_sales_by_period(month_start, today)
+        else:
+            sales = get_all_caisse_sales(200)
+        
+        # Calculer les totaux de la période
+        total_period = sum(s['total'] or 0 for s in sales)
+        self.period_stats.configure(text=f"📊 {len(sales)} vente(s) | Total: {format_price(total_period)}")
+        
+        if not sales:
+            ctk.CTkLabel(self.historique_list, text="Aucune vente sur cette période", 
+                        text_color="#666").pack(pady=30)
+            return
+        
+        # En-tête
+        header = ctk.CTkFrame(self.historique_list, fg_color="#1a1a1a")
+        header.pack(fill="x", pady=(0, 5))
+        
+        ctk.CTkLabel(header, text="Date/Heure", width=140, font=("Helvetica", 10, "bold")).pack(side="left", padx=5, pady=8)
+        ctk.CTkLabel(header, text="Client", width=150, font=("Helvetica", 10, "bold")).pack(side="left", padx=5)
+        ctk.CTkLabel(header, text="Facture", width=100, font=("Helvetica", 10, "bold")).pack(side="left", padx=5)
+        ctk.CTkLabel(header, text="Paiement", width=80, font=("Helvetica", 10, "bold")).pack(side="left", padx=5)
+        ctk.CTkLabel(header, text="Total", width=100, font=("Helvetica", 10, "bold")).pack(side="right", padx=10)
+        ctk.CTkLabel(header, text="Ticket Z", width=80, font=("Helvetica", 10, "bold")).pack(side="right", padx=5)
+        
+        for sale in sales:
+            row = ctk.CTkFrame(self.historique_list, fg_color="#2a2a2a" if sales.index(sale) % 2 == 0 else "#333333")
+            row.pack(fill="x", pady=1)
+            
+            # Date
+            date_str = sale['date_sale'][:16] if sale['date_sale'] else ""
+            ctk.CTkLabel(row, text=date_str, width=140, font=("Helvetica", 10)).pack(side="left", padx=5, pady=6)
+            
+            # Client
+            client_name = sale['client_name'] or "Inconnu"
+            ctk.CTkLabel(row, text=client_name[:18], width=150, font=("Helvetica", 10)).pack(side="left", padx=5)
+            
+            # Facture
+            invoice_num = sale['invoice_number'] or "-"
+            ctk.CTkLabel(row, text=invoice_num, width=100, font=("Helvetica", 10), text_color="#888").pack(side="left", padx=5)
+            
+            # Mode de paiement
+            payment_icons = {'espèces': '💵', 'carte': '💳', 'autre': '📱'}
+            payment = sale['payment_method'] or 'espèces'
+            ctk.CTkLabel(row, text=f"{payment_icons.get(payment, '💰')} {payment}", width=80, 
+                        font=("Helvetica", 10)).pack(side="left", padx=5)
+            
+            # Total
+            ctk.CTkLabel(row, text=format_price(sale['total'] or 0), width=100, 
+                        font=("Helvetica", 10, "bold"), text_color=KRYSTO_SECONDARY).pack(side="right", padx=10)
+            
+            # Ticket Z
+            tz_num = sale['ticket_z_number'] if 'ticket_z_number' in sale.keys() and sale['ticket_z_number'] else "-"
+            tz_color = KRYSTO_SECONDARY if tz_num != "-" else "#666"
+            ctk.CTkLabel(row, text=f"Z{tz_num}" if tz_num != "-" else "-", width=80, 
+                        font=("Helvetica", 10), text_color=tz_color).pack(side="right", padx=5)
+    
+    def _load_tickets_z(self):
+        """Charge la liste des tickets Z."""
+        for w in self.tickets_z_list.winfo_children():
+            w.destroy()
+        
+        tickets = get_all_tickets_z()
+        
+        if not tickets:
+            ctk.CTkLabel(self.tickets_z_list, text="Aucun ticket Z généré", 
+                        text_color="#666").pack(pady=30)
+            return
+        
+        for ticket in tickets:
+            t = dict(ticket)
+            
+            frame = ctk.CTkFrame(self.tickets_z_list, fg_color="#2a2a2a", corner_radius=10)
+            frame.pack(fill="x", pady=5, padx=5)
+            
+            # Header du ticket
+            header = ctk.CTkFrame(frame, fg_color="transparent")
+            header.pack(fill="x", padx=15, pady=10)
+            
+            ctk.CTkLabel(header, text=f"🧾 TICKET Z N°{t['number']}", 
+                        font=("Helvetica", 14, "bold")).pack(side="left")
+            
+            date_close = t['date_close'][:16] if t['date_close'] else ""
+            ctk.CTkLabel(header, text=date_close, text_color="#888", 
+                        font=("Helvetica", 11)).pack(side="right")
+            
+            # Détails
+            details = ctk.CTkFrame(frame, fg_color="#1a1a1a", corner_radius=5)
+            details.pack(fill="x", padx=15, pady=(0, 15))
+            
+            row1 = ctk.CTkFrame(details, fg_color="transparent")
+            row1.pack(fill="x", padx=15, pady=10)
+            
+            ctk.CTkLabel(row1, text=f"📊 {t['nb_sales']} vente(s)", font=("Helvetica", 11)).pack(side="left", padx=10)
+            ctk.CTkLabel(row1, text=f"💵 Espèces: {format_price(t['total_especes'] or 0)}", 
+                        font=("Helvetica", 11)).pack(side="left", padx=10)
+            ctk.CTkLabel(row1, text=f"💳 Carte: {format_price(t['total_carte'] or 0)}", 
+                        font=("Helvetica", 11)).pack(side="left", padx=10)
+            ctk.CTkLabel(row1, text=f"📱 Autre: {format_price(t['total_autre'] or 0)}", 
+                        font=("Helvetica", 11)).pack(side="left", padx=10)
+            
+            row2 = ctk.CTkFrame(details, fg_color="transparent")
+            row2.pack(fill="x", padx=15, pady=(0, 10))
+            
+            ctk.CTkLabel(row2, text=f"HT: {format_price(t['total_ht'] or 0)}", 
+                        font=("Helvetica", 10), text_color="#888").pack(side="left", padx=10)
+            ctk.CTkLabel(row2, text=f"TGC: {format_price(t['total_tgc'] or 0)}", 
+                        font=("Helvetica", 10), text_color="#888").pack(side="left", padx=10)
+            ctk.CTkLabel(row2, text=f"TOTAL TTC: {format_price(t['total_ttc'] or 0)}", 
+                        font=("Helvetica", 12, "bold"), text_color=KRYSTO_SECONDARY).pack(side="right", padx=10)
+            
+            # Bouton voir détails
+            ctk.CTkButton(frame, text="📋 Voir ventes", fg_color=KRYSTO_PRIMARY, width=100, height=28,
+                         command=lambda tid=t['id']: self._show_ticket_z_details(tid)).pack(anchor="e", padx=15, pady=(0, 10))
+    
+    def _show_ticket_z_details(self, ticket_id):
+        """Affiche les détails d'un ticket Z."""
+        ticket = get_ticket_z(ticket_id)
+        sales = get_caisse_sales_by_ticket_z(ticket_id)
+        
+        if not ticket:
+            return
+        
+        t = dict(ticket)
+        
+        # Créer une fenêtre popup
+        popup = ctk.CTkToplevel(self)
+        popup.title(f"Ticket Z N°{t['number']}")
+        popup.geometry("700x500")
+        popup.transient(self)
+        popup.grab_set()
+        
+        # Header
+        header = ctk.CTkFrame(popup, fg_color=KRYSTO_DARK)
+        header.pack(fill="x", padx=20, pady=20)
+        
+        ctk.CTkLabel(header, text=f"🧾 TICKET Z N°{t['number']}", 
+                    font=("Helvetica", 18, "bold")).pack(pady=15)
+        ctk.CTkLabel(header, text=f"Clôturé le: {t['date_close'][:16] if t['date_close'] else ''}", 
+                    text_color="#888").pack(pady=(0, 15))
+        
+        # Résumé
+        summary = ctk.CTkFrame(popup, fg_color="#2a2a2a")
+        summary.pack(fill="x", padx=20, pady=10)
+        
+        row = ctk.CTkFrame(summary, fg_color="transparent")
+        row.pack(pady=15)
+        
+        for label, value, color in [
+            ("Ventes", str(t['nb_sales']), "#fff"),
+            ("Espèces", format_price(t['total_especes'] or 0), "#28a745"),
+            ("Carte", format_price(t['total_carte'] or 0), "#17a2b8"),
+            ("Autre", format_price(t['total_autre'] or 0), "#6c5ce7"),
+            ("TOTAL", format_price(t['total_ttc'] or 0), KRYSTO_SECONDARY)
+        ]:
+            col = ctk.CTkFrame(row, fg_color="transparent")
+            col.pack(side="left", padx=20)
+            ctk.CTkLabel(col, text=label, text_color="#888", font=("Helvetica", 10)).pack()
+            ctk.CTkLabel(col, text=value, text_color=color, font=("Helvetica", 14, "bold")).pack()
+        
+        # Liste des ventes
+        ctk.CTkLabel(popup, text="📋 Détail des ventes", font=("Helvetica", 13, "bold")).pack(anchor="w", padx=25, pady=(15, 5))
+        
+        sales_list = ctk.CTkScrollableFrame(popup, fg_color="#2a2a2a")
+        sales_list.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        for sale in sales:
+            s = dict(sale)
+            srow = ctk.CTkFrame(sales_list, fg_color="#1a1a1a")
+            srow.pack(fill="x", pady=2, padx=5)
+            
+            ctk.CTkLabel(srow, text=s['date_sale'][:16] if s['date_sale'] else "", 
+                        width=130, font=("Helvetica", 10)).pack(side="left", padx=5, pady=6)
+            ctk.CTkLabel(srow, text=s['client_name'] or "N/A", width=150, 
+                        font=("Helvetica", 10)).pack(side="left", padx=5)
+            
+            payment_icons = {'espèces': '💵', 'carte': '💳', 'autre': '📱'}
+            payment = s['payment_method'] or 'espèces'
+            ctk.CTkLabel(srow, text=payment_icons.get(payment, '💰'), 
+                        font=("Helvetica", 10)).pack(side="left", padx=5)
+            
+            ctk.CTkLabel(srow, text=format_price(s['total'] or 0), 
+                        font=("Helvetica", 10, "bold"), text_color=KRYSTO_SECONDARY).pack(side="right", padx=10)
+    
+    def _generate_ticket_z(self):
+        """Génère le ticket Z (clôture de caisse)."""
+        stats = get_caisse_stats_today()
+        
+        if stats['nb_sales'] == 0:
+            messagebox.showinfo("Ticket Z", "Aucune vente à clôturer aujourd'hui.")
+            return
+        
+        # Confirmation
+        msg = f"""Clôturer la caisse ?
+
+📊 Ventes du jour: {stats['nb_sales']}
+💵 Espèces: {format_price(stats['total_especes'])}
+💳 Carte: {format_price(stats['total_carte'])}
+📱 Autre: {format_price(stats['total_autre'])}
+
+💰 TOTAL: {format_price(stats['total_ttc'])}
+
+Cette action est irréversible."""
+        
+        if not messagebox.askyesno("Ticket Z - Clôture de caisse", msg):
+            return
+        
+        # Générer le ticket Z
+        ticket_id, result = close_ticket_z()
+        
+        if ticket_id is None:
+            messagebox.showerror("Erreur", str(result))
+            return
+        
+        # Afficher le résultat
+        messagebox.showinfo("Ticket Z généré", 
+            f"""✅ TICKET Z N°{result['number']} GÉNÉRÉ
+
+📊 {result['nb_sales']} vente(s) clôturée(s)
+
+💵 Espèces: {format_price(result['total_especes'])}
+💳 Carte: {format_price(result['total_carte'])}
+📱 Autre: {format_price(result['total_autre'])}
+
+💰 TOTAL TTC: {format_price(result['total_ttc'])}
+
+Caisse clôturée avec succès!""")
+        
+        # Rafraîchir les affichages
+        self._update_stats()
+        self._load_historique()
+        self._load_tickets_z()
+
+
+class CaisseClientDialog(ctk.CTkToplevel):
+    """Dialogue de création rapide de client depuis la caisse."""
+    
+    def __init__(self, parent, on_save=None):
+        super().__init__(parent)
+        self.on_save = on_save
+        self.title("👤 Nouveau client")
+        self.geometry("450x500")
+        self.transient(parent)
+        self.grab_set()
+        self._create_ui()
+    
+    def _create_ui(self):
+        main = ctk.CTkScrollableFrame(self)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(main, text="Créer un nouveau client", font=("Helvetica", 16, "bold")).pack(anchor="w", pady=(0, 15))
+        
+        ctk.CTkLabel(main, text="Nom *").pack(anchor="w")
+        self.name_entry = ctk.CTkEntry(main, height=38)
+        self.name_entry.pack(fill="x", pady=(0, 10))
+        self.name_entry.focus()
+        
+        ctk.CTkLabel(main, text="Email (pour recevoir la facture)").pack(anchor="w")
+        self.email_entry = ctk.CTkEntry(main, height=38, placeholder_text="email@exemple.com")
+        self.email_entry.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(main, text="Téléphone").pack(anchor="w")
+        self.phone_entry = ctk.CTkEntry(main, height=38, placeholder_text="+687...")
+        self.phone_entry.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(main, text="Adresse").pack(anchor="w")
+        self.address_entry = ctk.CTkEntry(main, height=38)
+        self.address_entry.pack(fill="x", pady=(0, 15))
+        
+        # Newsletter
+        self.newsletter_var = ctk.BooleanVar(value=True)
+        newsletter_frame = ctk.CTkFrame(main, fg_color=KRYSTO_DARK, corner_radius=10)
+        newsletter_frame.pack(fill="x", pady=10)
+        
+        ctk.CTkCheckBox(newsletter_frame, text="📧 S'inscrire à la newsletter", 
+                        variable=self.newsletter_var,
+                        font=("Helvetica", 12)).pack(anchor="w", padx=15, pady=15)
+        
+        ctk.CTkLabel(newsletter_frame, text="Recevoir nos offres et actualités par email",
+                     text_color="#888", font=("Helvetica", 10)).pack(anchor="w", padx=15, pady=(0, 15))
+        
+        # Boutons
+        btn_frame = ctk.CTkFrame(main, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=20)
+        
+        ctk.CTkButton(btn_frame, text="Annuler", fg_color="gray", width=100,
+                      command=self.destroy).pack(side="left")
+        ctk.CTkButton(btn_frame, text="✅ Créer le client", fg_color=KRYSTO_PRIMARY, width=150,
+                      command=self._save).pack(side="right")
+    
+    def _save(self):
+        name = self.name_entry.get().strip()
+        if not name:
+            messagebox.showwarning("Attention", "Le nom est obligatoire")
+            return
+        
+        email = self.email_entry.get().strip()
+        if email and '@' not in email:
+            messagebox.showwarning("Attention", "Email invalide")
+            return
+        
+        data = {
+            'name': name,
+            'email': email,
+            'phone': self.phone_entry.get().strip(),
+            'address': self.address_entry.get().strip(),
+            'client_type': 'particulier',
+            'newsletter': 1 if self.newsletter_var.get() else 0,
+            'is_prospect': 0  # Client direct, pas prospect
+        }
+        
+        client_id = save_client(data)
+        
+        messagebox.showinfo("Succès", f"Client '{name}' créé!" + 
+                           ("\n📧 Inscrit à la newsletter" if self.newsletter_var.get() else ""))
+        
+        if self.on_save:
+            self.on_save(client_id)
+        
+        self.destroy()
 
 
 # ============================================================================
@@ -11364,11 +13137,6 @@ class DashboardFrame(ctk.CTkFrame):
             self._refresh()
         else:
             messagebox.showinfo("Rotation", "Aucune dette à faire tourner.")
-        self.action_status.configure(text="✅ Tâches auto actives", text_color=KRYSTO_SECONDARY)
-        msg = f"✅ Envoyés: {results['sent']}"
-        if results['errors']:
-            msg += f"\n❌ Erreurs: {len(results['errors'])}"
-        messagebox.showinfo("Rappels envoyés", msg)
 
 
 class ConfigDialog(ctk.CTkToplevel):
@@ -11526,7 +13294,7 @@ class ConfigDialog(ctk.CTkToplevel):
 class KrystoApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"{COMPANY_NAME} - v8.0")
+        self.title(f"{COMPANY_NAME} - v8.3")
         self.geometry("1400x900")
         self.minsize(1200, 700)
         
@@ -11600,6 +13368,7 @@ class KrystoApp(ctk.CTk):
         # Menu principal avec tous les modules
         menu_items = [
             ("🏠", "Tableau de bord", "dashboard"),
+            ("🛒", "Caisse", "caisse"),
             ("📊", "Statistiques", "stats"),
             ("👥", "Clients", "clients"),
             ("📄", "Devis/Factures", "invoices"),
@@ -11629,13 +13398,14 @@ class KrystoApp(ctk.CTk):
         ctk.CTkButton(utils_frame, text="⚙️ Configuration", anchor="w", height=32, fg_color="transparent",
                       hover_color="#3a3a3a", font=("Helvetica", 10), command=self._open_config).pack(fill="x", padx=10, pady=1)
         
-        ctk.CTkLabel(utils_frame, text=f"v8.0 | Ctrl+F: Recherche", text_color="#555", font=("Helvetica", 8)).pack(pady=5)
+        ctk.CTkLabel(utils_frame, text=f"v8.3 | Ctrl+F: Recherche", text_color="#555", font=("Helvetica", 8)).pack(pady=5)
         
         self.main_container = ctk.CTkFrame(self, fg_color="#1a1a1a", corner_radius=0)
         self.main_container.pack(side="left", fill="both", expand=True)
         
         self.frames = {
             "dashboard": DashboardFrame(self.main_container),
+            "caisse": CaisseFrame(self.main_container),
             "stats": StatistiquesFrame(self.main_container),
             "clients": ClientsFrame(self.main_container),
             "invoices": DevisFacturesFrame(self.main_container),
