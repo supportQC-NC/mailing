@@ -1,0 +1,8 @@
+{
+  "host": "smtp.hostinger.com",
+  "port": 465,
+  "use_ssl": true,
+  "username": "infos@krysto.io",
+  "password": "Aska-19031985",
+  "from_name": "KRYSTO"
+}
