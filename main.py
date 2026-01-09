@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 KRYSTO - Gestionnaire Clients, Produits, Dépôts-Ventes & Mailing
-Version 7.0 - Focus sur l'essentiel
+Version 8.0 - Version Complète avec CRM, Devis/Factures, Statistiques
 Devise: XPF (Franc Pacifique)
 """
 
@@ -21,6 +21,32 @@ import json
 import tempfile
 import copy
 import urllib.parse
+import csv
+import shutil
+import re
+from io import BytesIO
+
+# Pour les graphiques (optionnel)
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+# Pour les PDF (optionnel - fallback en HTML)
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm, cm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+    from reportlab.pdfgen import canvas
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
 
 # ============================================================================
 # CONSTANTES
@@ -32,6 +58,26 @@ COMPANY_WEBSITE = "www.krysto.nc"
 COMPANY_PHONE = "+687 123 456"
 COMPANY_RIDET = ""  # Numéro RIDET entreprise
 COMPANY_SLOGAN = "Recyclage & Upcycling"
+
+# TGC Nouvelle-Calédonie (Taxe Générale sur la Consommation)
+TGC_RATES = {
+    "exonéré": 0,
+    "réduit": 3,
+    "normal": 11,
+    "intermédiaire": 6,
+    "spécifique": 22
+}
+DEFAULT_TGC_RATE = "normal"
+
+# Numérotation factures/devis
+INVOICE_PREFIX = "FA"
+QUOTE_PREFIX = "DE"
+
+# Types d'interactions CRM
+INTERACTION_TYPES = ["📞 Appel", "📧 Email", "🤝 RDV", "💬 Message", "📝 Note", "🎁 Cadeau", "📦 Livraison"]
+
+# Thème de l'application
+THEME_MODE = "dark"  # dark ou light
 
 # Couleurs par défaut (peuvent être changées dans l'app)
 KRYSTO_PRIMARY = "#6d74ab"
@@ -3403,6 +3449,170 @@ def init_database():
         UNIQUE(group_id, client_id)
     )''')
     
+    # ==================== NOUVELLES TABLES V8 ====================
+    
+    # Table devis
+    c.execute('''CREATE TABLE IF NOT EXISTS quotes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        number TEXT UNIQUE NOT NULL,
+        client_id INTEGER NOT NULL,
+        date_quote TEXT DEFAULT CURRENT_TIMESTAMP,
+        date_validity TEXT,
+        status TEXT DEFAULT 'brouillon',
+        subtotal REAL DEFAULT 0,
+        tgc_rate TEXT DEFAULT 'normal',
+        tgc_amount REAL DEFAULT 0,
+        total REAL DEFAULT 0,
+        notes TEXT,
+        conditions TEXT,
+        date_created TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (client_id) REFERENCES clients(id)
+    )''')
+    
+    # Table lignes de devis
+    c.execute('''CREATE TABLE IF NOT EXISTS quote_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        quote_id INTEGER NOT NULL,
+        product_id INTEGER,
+        description TEXT NOT NULL,
+        quantity REAL DEFAULT 1,
+        unit_price REAL DEFAULT 0,
+        discount_percent REAL DEFAULT 0,
+        total REAL DEFAULT 0,
+        position INTEGER DEFAULT 0,
+        FOREIGN KEY (quote_id) REFERENCES quotes(id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    )''')
+    
+    # Table factures
+    c.execute('''CREATE TABLE IF NOT EXISTS invoices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        number TEXT UNIQUE NOT NULL,
+        quote_id INTEGER,
+        client_id INTEGER NOT NULL,
+        date_invoice TEXT DEFAULT CURRENT_TIMESTAMP,
+        date_due TEXT,
+        status TEXT DEFAULT 'brouillon',
+        subtotal REAL DEFAULT 0,
+        tgc_rate TEXT DEFAULT 'normal',
+        tgc_amount REAL DEFAULT 0,
+        total REAL DEFAULT 0,
+        amount_paid REAL DEFAULT 0,
+        notes TEXT,
+        conditions TEXT,
+        date_created TEXT DEFAULT CURRENT_TIMESTAMP,
+        date_paid TEXT,
+        FOREIGN KEY (quote_id) REFERENCES quotes(id),
+        FOREIGN KEY (client_id) REFERENCES clients(id)
+    )''')
+    
+    # Table lignes de factures
+    c.execute('''CREATE TABLE IF NOT EXISTS invoice_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER NOT NULL,
+        product_id INTEGER,
+        description TEXT NOT NULL,
+        quantity REAL DEFAULT 1,
+        unit_price REAL DEFAULT 0,
+        discount_percent REAL DEFAULT 0,
+        total REAL DEFAULT 0,
+        position INTEGER DEFAULT 0,
+        FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    )''')
+    
+    # Table interactions CRM
+    c.execute('''CREATE TABLE IF NOT EXISTS interactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_id INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        subject TEXT,
+        content TEXT,
+        date_interaction TEXT DEFAULT CURRENT_TIMESTAMP,
+        duration_minutes INTEGER,
+        followup_date TEXT,
+        followup_done INTEGER DEFAULT 0,
+        FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+    )''')
+    
+    # Table tâches/rappels
+    c.execute('''CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_id INTEGER,
+        title TEXT NOT NULL,
+        description TEXT,
+        due_date TEXT,
+        priority TEXT DEFAULT 'normale',
+        status TEXT DEFAULT 'à faire',
+        reminder_date TEXT,
+        date_created TEXT DEFAULT CURRENT_TIMESTAMP,
+        date_completed TEXT,
+        FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE SET NULL
+    )''')
+    
+    # Table emails programmés
+    c.execute('''CREATE TABLE IF NOT EXISTS scheduled_emails (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        template_id INTEGER,
+        recipient_filter TEXT,
+        recipient_group_id INTEGER,
+        subject TEXT NOT NULL,
+        content_json TEXT,
+        scheduled_date TEXT NOT NULL,
+        status TEXT DEFAULT 'programmé',
+        sent_count INTEGER DEFAULT 0,
+        date_created TEXT DEFAULT CURRENT_TIMESTAMP,
+        date_sent TEXT,
+        FOREIGN KEY (template_id) REFERENCES email_templates(id),
+        FOREIGN KEY (recipient_group_id) REFERENCES client_groups(id)
+    )''')
+    
+    # Table séquences emails automatiques
+    c.execute('''CREATE TABLE IF NOT EXISTS email_sequences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        trigger_event TEXT NOT NULL,
+        active INTEGER DEFAULT 1,
+        date_created TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    
+    # Table étapes des séquences
+    c.execute('''CREATE TABLE IF NOT EXISTS email_sequence_steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sequence_id INTEGER NOT NULL,
+        step_order INTEGER NOT NULL,
+        delay_days INTEGER DEFAULT 0,
+        delay_hours INTEGER DEFAULT 0,
+        template_id INTEGER,
+        subject TEXT,
+        content_json TEXT,
+        FOREIGN KEY (sequence_id) REFERENCES email_sequences(id) ON DELETE CASCADE,
+        FOREIGN KEY (template_id) REFERENCES email_templates(id)
+    )''')
+    
+    # Table historique des séquences envoyées
+    c.execute('''CREATE TABLE IF NOT EXISTS email_sequence_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sequence_id INTEGER NOT NULL,
+        client_id INTEGER NOT NULL,
+        current_step INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'en_cours',
+        started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        next_send_at TEXT,
+        completed_at TEXT,
+        FOREIGN KEY (sequence_id) REFERENCES email_sequences(id),
+        FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+    )''')
+    
+    # Table compteurs pour numérotation
+    c.execute('''CREATE TABLE IF NOT EXISTS counters (
+        name TEXT PRIMARY KEY,
+        value INTEGER DEFAULT 0,
+        year INTEGER
+    )''')
+    
+    # ==================== FIN NOUVELLES TABLES ====================
+    
     # Migrations colonnes manquantes
     migrations = [
         ("clients", "dette_m1", "REAL DEFAULT 0"),
@@ -3619,6 +3829,735 @@ def get_all_prospects():
     clients = conn.execute("SELECT * FROM clients WHERE is_prospect = 1 ORDER BY name").fetchall()
     conn.close()
     return clients
+
+
+# ============================================================================
+# FONCTIONS DEVIS & FACTURES
+# ============================================================================
+def get_next_number(prefix):
+    """Génère le prochain numéro de devis ou facture."""
+    conn = get_connection()
+    c = conn.cursor()
+    year = datetime.now().year
+    
+    # Vérifier/créer le compteur
+    counter = c.execute("SELECT value, year FROM counters WHERE name=?", (prefix,)).fetchone()
+    
+    if counter and counter[1] == year:
+        new_value = counter[0] + 1
+        c.execute("UPDATE counters SET value=? WHERE name=?", (new_value, prefix))
+    else:
+        new_value = 1
+        c.execute("INSERT OR REPLACE INTO counters (name, value, year) VALUES (?, ?, ?)", 
+                  (prefix, new_value, year))
+    
+    conn.commit()
+    conn.close()
+    return f"{prefix}{year}-{new_value:04d}"
+
+
+def get_all_quotes(client_id=None, status=None):
+    """Récupère tous les devis."""
+    conn = get_connection()
+    query = "SELECT q.*, c.name as client_name FROM quotes q LEFT JOIN clients c ON q.client_id = c.id WHERE 1=1"
+    params = []
+    if client_id: query += " AND q.client_id=?"; params.append(client_id)
+    if status: query += " AND q.status=?"; params.append(status)
+    query += " ORDER BY q.date_created DESC"
+    quotes = conn.execute(query, params).fetchall()
+    conn.close()
+    return quotes
+
+
+def get_quote(quote_id):
+    """Récupère un devis avec ses lignes."""
+    conn = get_connection()
+    quote = conn.execute("""SELECT q.*, c.name as client_name, c.email as client_email, 
+                            c.address as client_address, c.phone as client_phone, c.ridet as client_ridet
+                            FROM quotes q LEFT JOIN clients c ON q.client_id = c.id 
+                            WHERE q.id=?""", (quote_id,)).fetchone()
+    if quote:
+        lines = conn.execute("""SELECT ql.*, p.name as product_name 
+                                FROM quote_lines ql LEFT JOIN products p ON ql.product_id = p.id
+                                WHERE ql.quote_id=? ORDER BY ql.position""", (quote_id,)).fetchall()
+    else:
+        lines = []
+    conn.close()
+    return quote, lines
+
+
+def save_quote(data, lines, quote_id=None):
+    """Sauvegarde un devis."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # Calculer les totaux
+    subtotal = sum(l.get('total', 0) for l in lines)
+    tgc_rate = data.get('tgc_rate', DEFAULT_TGC_RATE)
+    tgc_percent = TGC_RATES.get(tgc_rate, 11)
+    tgc_amount = subtotal * tgc_percent / 100
+    total = subtotal + tgc_amount
+    
+    if quote_id:
+        c.execute("""UPDATE quotes SET client_id=?, date_validity=?, status=?, 
+                     subtotal=?, tgc_rate=?, tgc_amount=?, total=?, notes=?, conditions=?
+                     WHERE id=?""",
+                  (data['client_id'], data.get('date_validity'), data.get('status', 'brouillon'),
+                   subtotal, tgc_rate, tgc_amount, total, data.get('notes'), data.get('conditions'),
+                   quote_id))
+        # Supprimer les anciennes lignes
+        c.execute("DELETE FROM quote_lines WHERE quote_id=?", (quote_id,))
+    else:
+        number = get_next_number(QUOTE_PREFIX)
+        c.execute("""INSERT INTO quotes (number, client_id, date_validity, status,
+                     subtotal, tgc_rate, tgc_amount, total, notes, conditions)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (number, data['client_id'], data.get('date_validity'), data.get('status', 'brouillon'),
+                   subtotal, tgc_rate, tgc_amount, total, data.get('notes'), data.get('conditions')))
+        quote_id = c.lastrowid
+    
+    # Ajouter les lignes
+    for i, line in enumerate(lines):
+        line_total = line.get('quantity', 1) * line.get('unit_price', 0) * (1 - line.get('discount_percent', 0) / 100)
+        c.execute("""INSERT INTO quote_lines (quote_id, product_id, description, quantity, 
+                     unit_price, discount_percent, total, position)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (quote_id, line.get('product_id'), line['description'], line.get('quantity', 1),
+                   line.get('unit_price', 0), line.get('discount_percent', 0), line_total, i))
+    
+    conn.commit()
+    conn.close()
+    return quote_id
+
+
+def delete_quote(quote_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM quotes WHERE id=?", (quote_id,))
+    conn.commit()
+    conn.close()
+
+
+def convert_quote_to_invoice(quote_id):
+    """Convertit un devis en facture."""
+    quote, lines = get_quote(quote_id)
+    if not quote: return None
+    
+    conn = get_connection()
+    c = conn.cursor()
+    
+    number = get_next_number(INVOICE_PREFIX)
+    due_date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
+    
+    c.execute("""INSERT INTO invoices (number, quote_id, client_id, date_due, status,
+                 subtotal, tgc_rate, tgc_amount, total, notes, conditions)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              (number, quote_id, quote['client_id'], due_date, 'envoyée',
+               quote['subtotal'], quote['tgc_rate'], quote['tgc_amount'], quote['total'],
+               quote['notes'], quote['conditions']))
+    invoice_id = c.lastrowid
+    
+    # Copier les lignes
+    for line in lines:
+        c.execute("""INSERT INTO invoice_lines (invoice_id, product_id, description, quantity,
+                     unit_price, discount_percent, total, position)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (invoice_id, line['product_id'], line['description'], line['quantity'],
+                   line['unit_price'], line['discount_percent'], line['total'], line['position']))
+    
+    # Marquer le devis comme accepté
+    c.execute("UPDATE quotes SET status='accepté' WHERE id=?", (quote_id,))
+    
+    conn.commit()
+    conn.close()
+    return invoice_id
+
+
+def get_all_invoices(client_id=None, status=None):
+    """Récupère toutes les factures."""
+    conn = get_connection()
+    query = "SELECT i.*, c.name as client_name FROM invoices i LEFT JOIN clients c ON i.client_id = c.id WHERE 1=1"
+    params = []
+    if client_id: query += " AND i.client_id=?"; params.append(client_id)
+    if status: query += " AND i.status=?"; params.append(status)
+    query += " ORDER BY i.date_created DESC"
+    invoices = conn.execute(query, params).fetchall()
+    conn.close()
+    return invoices
+
+
+def get_invoice(invoice_id):
+    """Récupère une facture avec ses lignes."""
+    conn = get_connection()
+    invoice = conn.execute("""SELECT i.*, c.name as client_name, c.email as client_email,
+                              c.address as client_address, c.phone as client_phone, c.ridet as client_ridet
+                              FROM invoices i LEFT JOIN clients c ON i.client_id = c.id
+                              WHERE i.id=?""", (invoice_id,)).fetchone()
+    if invoice:
+        lines = conn.execute("""SELECT il.*, p.name as product_name
+                                FROM invoice_lines il LEFT JOIN products p ON il.product_id = p.id
+                                WHERE il.invoice_id=? ORDER BY il.position""", (invoice_id,)).fetchall()
+    else:
+        lines = []
+    conn.close()
+    return invoice, lines
+
+
+def save_invoice(data, lines, invoice_id=None):
+    """Sauvegarde une facture."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    subtotal = sum(l.get('total', 0) for l in lines)
+    tgc_rate = data.get('tgc_rate', DEFAULT_TGC_RATE)
+    tgc_percent = TGC_RATES.get(tgc_rate, 11)
+    tgc_amount = subtotal * tgc_percent / 100
+    total = subtotal + tgc_amount
+    
+    if invoice_id:
+        c.execute("""UPDATE invoices SET client_id=?, date_due=?, status=?,
+                     subtotal=?, tgc_rate=?, tgc_amount=?, total=?, 
+                     amount_paid=?, notes=?, conditions=?, date_paid=?
+                     WHERE id=?""",
+                  (data['client_id'], data.get('date_due'), data.get('status', 'brouillon'),
+                   subtotal, tgc_rate, tgc_amount, total,
+                   data.get('amount_paid', 0), data.get('notes'), data.get('conditions'),
+                   data.get('date_paid'), invoice_id))
+        c.execute("DELETE FROM invoice_lines WHERE invoice_id=?", (invoice_id,))
+    else:
+        number = get_next_number(INVOICE_PREFIX)
+        c.execute("""INSERT INTO invoices (number, client_id, date_due, status,
+                     subtotal, tgc_rate, tgc_amount, total, notes, conditions)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (number, data['client_id'], data.get('date_due'), data.get('status', 'brouillon'),
+                   subtotal, tgc_rate, tgc_amount, total, data.get('notes'), data.get('conditions')))
+        invoice_id = c.lastrowid
+    
+    for i, line in enumerate(lines):
+        line_total = line.get('quantity', 1) * line.get('unit_price', 0) * (1 - line.get('discount_percent', 0) / 100)
+        c.execute("""INSERT INTO invoice_lines (invoice_id, product_id, description, quantity,
+                     unit_price, discount_percent, total, position)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (invoice_id, line.get('product_id'), line['description'], line.get('quantity', 1),
+                   line.get('unit_price', 0), line.get('discount_percent', 0), line_total, i))
+    
+    conn.commit()
+    conn.close()
+    return invoice_id
+
+
+def delete_invoice(invoice_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM invoices WHERE id=?", (invoice_id,))
+    conn.commit()
+    conn.close()
+
+
+def mark_invoice_paid(invoice_id, amount=None, date_paid=None):
+    """Marque une facture comme payée."""
+    conn = get_connection()
+    invoice = conn.execute("SELECT total FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+    if invoice:
+        paid_amount = amount if amount else invoice['total']
+        paid_date = date_paid if date_paid else datetime.now().strftime('%Y-%m-%d')
+        conn.execute("""UPDATE invoices SET status='payée', amount_paid=?, date_paid=? WHERE id=?""",
+                     (paid_amount, paid_date, invoice_id))
+        conn.commit()
+    conn.close()
+
+
+# ============================================================================
+# FONCTIONS CRM - INTERACTIONS
+# ============================================================================
+def get_all_interactions(client_id=None, limit=100):
+    """Récupère les interactions."""
+    conn = get_connection()
+    query = """SELECT i.*, c.name as client_name 
+               FROM interactions i LEFT JOIN clients c ON i.client_id = c.id WHERE 1=1"""
+    params = []
+    if client_id: query += " AND i.client_id=?"; params.append(client_id)
+    query += f" ORDER BY i.date_interaction DESC LIMIT {limit}"
+    interactions = conn.execute(query, params).fetchall()
+    conn.close()
+    return interactions
+
+
+def save_interaction(data, interaction_id=None):
+    """Sauvegarde une interaction."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    if interaction_id:
+        c.execute("""UPDATE interactions SET client_id=?, type=?, subject=?, content=?,
+                     date_interaction=?, duration_minutes=?, followup_date=?, followup_done=?
+                     WHERE id=?""",
+                  (data['client_id'], data['type'], data.get('subject'), data.get('content'),
+                   data.get('date_interaction', datetime.now().isoformat()), data.get('duration_minutes'),
+                   data.get('followup_date'), data.get('followup_done', 0), interaction_id))
+    else:
+        c.execute("""INSERT INTO interactions (client_id, type, subject, content,
+                     date_interaction, duration_minutes, followup_date)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                  (data['client_id'], data['type'], data.get('subject'), data.get('content'),
+                   data.get('date_interaction', datetime.now().isoformat()), data.get('duration_minutes'),
+                   data.get('followup_date')))
+        interaction_id = c.lastrowid
+    
+    conn.commit()
+    conn.close()
+    return interaction_id
+
+
+def delete_interaction(interaction_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM interactions WHERE id=?", (interaction_id,))
+    conn.commit()
+    conn.close()
+
+
+# ============================================================================
+# FONCTIONS CRM - TÂCHES
+# ============================================================================
+def get_all_tasks(status=None, client_id=None, include_completed=False):
+    """Récupère les tâches."""
+    conn = get_connection()
+    query = """SELECT t.*, c.name as client_name 
+               FROM tasks t LEFT JOIN clients c ON t.client_id = c.id WHERE 1=1"""
+    params = []
+    if client_id: query += " AND t.client_id=?"; params.append(client_id)
+    if status: query += " AND t.status=?"; params.append(status)
+    if not include_completed: query += " AND t.status != 'terminée'"
+    query += " ORDER BY CASE WHEN t.due_date IS NULL THEN 1 ELSE 0 END, t.due_date ASC"
+    tasks = conn.execute(query, params).fetchall()
+    conn.close()
+    return tasks
+
+
+def get_tasks_due_today():
+    """Récupère les tâches dues aujourd'hui."""
+    conn = get_connection()
+    today = datetime.now().strftime('%Y-%m-%d')
+    tasks = conn.execute("""SELECT t.*, c.name as client_name 
+                            FROM tasks t LEFT JOIN clients c ON t.client_id = c.id
+                            WHERE t.due_date <= ? AND t.status != 'terminée'
+                            ORDER BY t.priority DESC, t.due_date""", (today,)).fetchall()
+    conn.close()
+    return tasks
+
+
+def save_task(data, task_id=None):
+    """Sauvegarde une tâche."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    if task_id:
+        c.execute("""UPDATE tasks SET client_id=?, title=?, description=?, due_date=?,
+                     priority=?, status=?, reminder_date=?, date_completed=?
+                     WHERE id=?""",
+                  (data.get('client_id'), data['title'], data.get('description'), data.get('due_date'),
+                   data.get('priority', 'normale'), data.get('status', 'à faire'),
+                   data.get('reminder_date'), data.get('date_completed'), task_id))
+    else:
+        c.execute("""INSERT INTO tasks (client_id, title, description, due_date, priority, status, reminder_date)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                  (data.get('client_id'), data['title'], data.get('description'), data.get('due_date'),
+                   data.get('priority', 'normale'), data.get('status', 'à faire'), data.get('reminder_date')))
+        task_id = c.lastrowid
+    
+    conn.commit()
+    conn.close()
+    return task_id
+
+
+def complete_task(task_id):
+    """Marque une tâche comme terminée."""
+    conn = get_connection()
+    conn.execute("UPDATE tasks SET status='terminée', date_completed=? WHERE id=?",
+                 (datetime.now().isoformat(), task_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_task(task_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+
+
+# ============================================================================
+# FONCTIONS EMAILS PROGRAMMÉS
+# ============================================================================
+def get_scheduled_emails(status=None):
+    """Récupère les emails programmés."""
+    conn = get_connection()
+    query = "SELECT * FROM scheduled_emails WHERE 1=1"
+    params = []
+    if status: query += " AND status=?"; params.append(status)
+    query += " ORDER BY scheduled_date ASC"
+    emails = conn.execute(query, params).fetchall()
+    conn.close()
+    return emails
+
+
+def save_scheduled_email(data, email_id=None):
+    """Programme un email."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    if email_id:
+        c.execute("""UPDATE scheduled_emails SET template_id=?, recipient_filter=?, 
+                     recipient_group_id=?, subject=?, content_json=?, scheduled_date=?, status=?
+                     WHERE id=?""",
+                  (data.get('template_id'), data.get('recipient_filter'), data.get('recipient_group_id'),
+                   data['subject'], data.get('content_json'), data['scheduled_date'],
+                   data.get('status', 'programmé'), email_id))
+    else:
+        c.execute("""INSERT INTO scheduled_emails (template_id, recipient_filter, recipient_group_id,
+                     subject, content_json, scheduled_date)
+                     VALUES (?, ?, ?, ?, ?, ?)""",
+                  (data.get('template_id'), data.get('recipient_filter'), data.get('recipient_group_id'),
+                   data['subject'], data.get('content_json'), data['scheduled_date']))
+        email_id = c.lastrowid
+    
+    conn.commit()
+    conn.close()
+    return email_id
+
+
+def delete_scheduled_email(email_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM scheduled_emails WHERE id=?", (email_id,))
+    conn.commit()
+    conn.close()
+
+
+def check_and_send_scheduled_emails():
+    """Vérifie et envoie les emails programmés (à appeler régulièrement)."""
+    conn = get_connection()
+    now = datetime.now().isoformat()
+    
+    emails = conn.execute("""SELECT * FROM scheduled_emails 
+                             WHERE status='programmé' AND scheduled_date <= ?""", (now,)).fetchall()
+    
+    for email in emails:
+        # Logique d'envoi (simplifiée)
+        # TODO: Implémenter l'envoi réel
+        conn.execute("UPDATE scheduled_emails SET status='envoyé', date_sent=? WHERE id=?",
+                     (now, email['id']))
+    
+    conn.commit()
+    conn.close()
+    return len(emails)
+
+
+# ============================================================================
+# FONCTIONS SÉQUENCES EMAILS
+# ============================================================================
+def get_all_sequences():
+    """Récupère toutes les séquences email."""
+    conn = get_connection()
+    sequences = conn.execute("SELECT * FROM email_sequences ORDER BY name").fetchall()
+    conn.close()
+    return sequences
+
+
+def get_sequence_with_steps(sequence_id):
+    """Récupère une séquence avec ses étapes."""
+    conn = get_connection()
+    sequence = conn.execute("SELECT * FROM email_sequences WHERE id=?", (sequence_id,)).fetchone()
+    steps = conn.execute("""SELECT * FROM email_sequence_steps 
+                            WHERE sequence_id=? ORDER BY step_order""", (sequence_id,)).fetchall()
+    conn.close()
+    return sequence, steps
+
+
+def save_sequence(data, steps, sequence_id=None):
+    """Sauvegarde une séquence email."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    if sequence_id:
+        c.execute("UPDATE email_sequences SET name=?, trigger_event=?, active=? WHERE id=?",
+                  (data['name'], data['trigger_event'], data.get('active', 1), sequence_id))
+        c.execute("DELETE FROM email_sequence_steps WHERE sequence_id=?", (sequence_id,))
+    else:
+        c.execute("INSERT INTO email_sequences (name, trigger_event, active) VALUES (?, ?, ?)",
+                  (data['name'], data['trigger_event'], data.get('active', 1)))
+        sequence_id = c.lastrowid
+    
+    for i, step in enumerate(steps):
+        c.execute("""INSERT INTO email_sequence_steps (sequence_id, step_order, delay_days, 
+                     delay_hours, template_id, subject, content_json)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                  (sequence_id, i + 1, step.get('delay_days', 0), step.get('delay_hours', 0),
+                   step.get('template_id'), step.get('subject'), step.get('content_json')))
+    
+    conn.commit()
+    conn.close()
+    return sequence_id
+
+
+def start_sequence_for_client(sequence_id, client_id):
+    """Démarre une séquence pour un client."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # Vérifier si pas déjà en cours
+    existing = c.execute("""SELECT id FROM email_sequence_history 
+                            WHERE sequence_id=? AND client_id=? AND status='en_cours'""",
+                         (sequence_id, client_id)).fetchone()
+    if existing: 
+        conn.close()
+        return None
+    
+    # Calculer la prochaine date d'envoi
+    sequence, steps = get_sequence_with_steps(sequence_id)
+    if not steps:
+        conn.close()
+        return None
+    
+    first_step = steps[0]
+    delay = timedelta(days=first_step['delay_days'], hours=first_step['delay_hours'])
+    next_send = (datetime.now() + delay).isoformat()
+    
+    c.execute("""INSERT INTO email_sequence_history (sequence_id, client_id, current_step, next_send_at)
+                 VALUES (?, ?, 1, ?)""", (sequence_id, client_id, next_send))
+    history_id = c.lastrowid
+    
+    conn.commit()
+    conn.close()
+    return history_id
+
+
+# ============================================================================
+# FONCTIONS IMPORT/EXPORT
+# ============================================================================
+def export_clients_csv(filepath):
+    """Exporte les clients en CSV."""
+    conn = get_connection()
+    clients = conn.execute("SELECT * FROM clients ORDER BY name").fetchall()
+    conn.close()
+    
+    if not clients: return False, "Aucun client à exporter"
+    
+    fieldnames = clients[0].keys()
+    
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for client in clients:
+            writer.writerow(dict(client))
+    
+    return True, f"{len(clients)} clients exportés"
+
+
+def import_clients_csv(filepath):
+    """Importe des clients depuis un CSV."""
+    imported = 0
+    errors = []
+    
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            
+            for row in reader:
+                try:
+                    # Mapper les colonnes possibles
+                    name = row.get('name') or row.get('nom') or row.get('Nom') or row.get('raison_sociale')
+                    if not name:
+                        errors.append(f"Ligne sans nom: {row}")
+                        continue
+                    
+                    data = {
+                        'name': name,
+                        'email': row.get('email') or row.get('Email') or row.get('mail'),
+                        'phone': row.get('phone') or row.get('telephone') or row.get('Téléphone') or row.get('tel'),
+                        'address': row.get('address') or row.get('adresse') or row.get('Adresse'),
+                        'client_type': row.get('client_type') or row.get('type') or 'particulier',
+                        'newsletter': 1 if row.get('newsletter', '1').lower() in ['1', 'oui', 'yes', 'true'] else 0,
+                        'is_prospect': 1 if row.get('is_prospect', '0').lower() in ['1', 'oui', 'yes', 'true'] else 0,
+                        'notes': row.get('notes') or row.get('Notes'),
+                        'ridet': row.get('ridet') or row.get('RIDET'),
+                    }
+                    
+                    save_client(data)
+                    imported += 1
+                except Exception as e:
+                    errors.append(f"Erreur ligne {imported + 1}: {str(e)}")
+        
+        return True, f"{imported} clients importés" + (f", {len(errors)} erreurs" if errors else "")
+    except Exception as e:
+        return False, f"Erreur: {str(e)}"
+
+
+def export_products_csv(filepath):
+    """Exporte les produits en CSV."""
+    conn = get_connection()
+    products = conn.execute("SELECT * FROM products ORDER BY name").fetchall()
+    conn.close()
+    
+    if not products: return False, "Aucun produit à exporter"
+    
+    fieldnames = products[0].keys()
+    
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for product in products:
+            writer.writerow(dict(product))
+    
+    return True, f"{len(products)} produits exportés"
+
+
+def backup_database(backup_path=None):
+    """Crée une sauvegarde de la base de données."""
+    if not backup_path:
+        backup_path = f"krysto_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+    
+    try:
+        shutil.copy2(DB_PATH, backup_path)
+        return True, f"Sauvegarde créée: {backup_path}"
+    except Exception as e:
+        return False, f"Erreur: {str(e)}"
+
+
+def restore_database(backup_path):
+    """Restaure la base de données depuis une sauvegarde."""
+    try:
+        # Vérifier que c'est une base SQLite valide
+        test_conn = sqlite3.connect(backup_path)
+        test_conn.execute("SELECT * FROM clients LIMIT 1")
+        test_conn.close()
+        
+        # Créer une sauvegarde de l'actuelle avant restauration
+        backup_database(f"krysto_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+        
+        # Restaurer
+        shutil.copy2(backup_path, DB_PATH)
+        return True, "Base de données restaurée"
+    except Exception as e:
+        return False, f"Erreur: {str(e)}"
+
+
+# ============================================================================
+# FONCTIONS STATISTIQUES
+# ============================================================================
+def get_dashboard_stats():
+    """Récupère les statistiques pour le dashboard."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    stats = {}
+    
+    # Clients
+    stats['total_clients'] = c.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+    stats['total_prospects'] = c.execute("SELECT COUNT(*) FROM clients WHERE is_prospect=1").fetchone()[0]
+    stats['total_newsletter'] = c.execute("SELECT COUNT(*) FROM clients WHERE newsletter=1").fetchone()[0]
+    stats['new_clients_month'] = c.execute("""SELECT COUNT(*) FROM clients 
+        WHERE date_created >= date('now', '-30 days')""").fetchone()[0]
+    
+    # Produits
+    stats['total_products'] = c.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
+    
+    # Dettes
+    debt = c.execute("""SELECT SUM(dette_m1 + dette_m2 + dette_m3 + dette_m3plus) 
+                        FROM clients WHERE client_type='professionnel'""").fetchone()[0]
+    stats['total_debt'] = debt or 0
+    stats['clients_with_debt'] = c.execute("""SELECT COUNT(*) FROM clients 
+        WHERE (dette_m1 > 0 OR dette_m2 > 0 OR dette_m3 > 0 OR dette_m3plus > 0)""").fetchone()[0]
+    
+    # Devis/Factures
+    stats['quotes_pending'] = c.execute("SELECT COUNT(*) FROM quotes WHERE status='envoyé'").fetchone()[0]
+    stats['quotes_month'] = c.execute("""SELECT COUNT(*) FROM quotes 
+        WHERE date_created >= date('now', '-30 days')""").fetchone()[0]
+    stats['invoices_unpaid'] = c.execute("""SELECT COUNT(*) FROM invoices 
+        WHERE status IN ('envoyée', 'en_retard')""").fetchone()[0]
+    
+    revenue = c.execute("SELECT SUM(total) FROM invoices WHERE status='payée'").fetchone()[0]
+    stats['total_revenue'] = revenue or 0
+    
+    revenue_month = c.execute("""SELECT SUM(total) FROM invoices 
+        WHERE status='payée' AND date_paid >= date('now', '-30 days')""").fetchone()[0]
+    stats['revenue_month'] = revenue_month or 0
+    
+    # Tâches
+    stats['tasks_pending'] = c.execute("SELECT COUNT(*) FROM tasks WHERE status='à faire'").fetchone()[0]
+    stats['tasks_overdue'] = c.execute("""SELECT COUNT(*) FROM tasks 
+        WHERE status='à faire' AND due_date < date('now')""").fetchone()[0]
+    
+    # Conversion prospects
+    total_converted = c.execute("""SELECT COUNT(*) FROM clients 
+        WHERE is_prospect=0 AND date_created >= date('now', '-90 days')""").fetchone()[0]
+    if stats['total_prospects'] + total_converted > 0:
+        stats['conversion_rate'] = round(total_converted / (stats['total_prospects'] + total_converted) * 100, 1)
+    else:
+        stats['conversion_rate'] = 0
+    
+    conn.close()
+    return stats
+
+
+def get_monthly_stats(months=12):
+    """Récupère les statistiques mensuelles."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    stats = []
+    for i in range(months - 1, -1, -1):
+        month_start = (datetime.now().replace(day=1) - timedelta(days=i * 30)).strftime('%Y-%m-01')
+        month_end = (datetime.now().replace(day=1) - timedelta(days=(i - 1) * 30)).strftime('%Y-%m-01')
+        
+        new_clients = c.execute("""SELECT COUNT(*) FROM clients 
+            WHERE date_created >= ? AND date_created < ?""", (month_start, month_end)).fetchone()[0]
+        
+        revenue = c.execute("""SELECT SUM(total) FROM invoices 
+            WHERE status='payée' AND date_paid >= ? AND date_paid < ?""", 
+            (month_start, month_end)).fetchone()[0] or 0
+        
+        quotes = c.execute("""SELECT COUNT(*) FROM quotes 
+            WHERE date_created >= ? AND date_created < ?""", (month_start, month_end)).fetchone()[0]
+        
+        stats.append({
+            'month': month_start[:7],
+            'new_clients': new_clients,
+            'revenue': revenue,
+            'quotes': quotes
+        })
+    
+    conn.close()
+    return stats
+
+
+def get_top_clients(limit=10):
+    """Récupère les meilleurs clients (par CA facturé)."""
+    conn = get_connection()
+    clients = conn.execute("""
+        SELECT c.id, c.name, c.email, COUNT(i.id) as invoice_count, SUM(i.total) as total_revenue
+        FROM clients c
+        LEFT JOIN invoices i ON c.id = i.client_id AND i.status='payée'
+        GROUP BY c.id
+        ORDER BY total_revenue DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return clients
+
+
+def get_conversion_funnel():
+    """Récupère les données du funnel de conversion."""
+    conn = get_connection()
+    c = conn.cursor()
+    
+    funnel = {
+        'prospects': c.execute("SELECT COUNT(*) FROM clients WHERE is_prospect=1").fetchone()[0],
+        'clients': c.execute("SELECT COUNT(*) FROM clients WHERE is_prospect=0").fetchone()[0],
+        'with_quotes': c.execute("SELECT COUNT(DISTINCT client_id) FROM quotes").fetchone()[0],
+        'with_invoices': c.execute("SELECT COUNT(DISTINCT client_id) FROM invoices").fetchone()[0],
+        'with_paid': c.execute("SELECT COUNT(DISTINCT client_id) FROM invoices WHERE status='payée'").fetchone()[0],
+    }
+    
+    conn.close()
+    return funnel
 
 
 def toggle_client_block(client_id, block=True, motif=""):
@@ -9004,6 +9943,1230 @@ class MailingFrame(ctk.CTkFrame):
 
 
 # ============================================================================
+# STATISTIQUES FRAME
+# ============================================================================
+class StatistiquesFrame(ctk.CTkFrame):
+    def __init__(self, parent):
+        super().__init__(parent, fg_color="transparent")
+        self._create_ui()
+    
+    def _create_ui(self):
+        header = ctk.CTkFrame(self, fg_color=KRYSTO_DARK, corner_radius=10)
+        header.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(header, text="📊 Statistiques", font=("Helvetica", 20, "bold")).pack(side="left", padx=20, pady=15)
+        ctk.CTkButton(header, text="🔄 Actualiser", fg_color=KRYSTO_PRIMARY,
+                      command=self._refresh).pack(side="right", padx=20, pady=10)
+        
+        # Tabs pour les différentes vues
+        self.tabs = ctk.CTkTabview(self, fg_color=KRYSTO_DARK)
+        self.tabs.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self.tabs.add("📈 Vue d'ensemble")
+        self.tabs.add("👥 Clients")
+        self.tabs.add("💰 Revenus")
+        self.tabs.add("🏆 Top Clients")
+        
+        self._create_overview_tab(self.tabs.tab("📈 Vue d'ensemble"))
+        self._create_clients_tab(self.tabs.tab("👥 Clients"))
+        self._create_revenue_tab(self.tabs.tab("💰 Revenus"))
+        self._create_top_clients_tab(self.tabs.tab("🏆 Top Clients"))
+        
+        self._refresh()
+    
+    def _create_overview_tab(self, parent):
+        self.overview_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self.overview_frame.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    def _create_clients_tab(self, parent):
+        self.clients_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.clients_frame.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    def _create_revenue_tab(self, parent):
+        self.revenue_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        self.revenue_frame.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    def _create_top_clients_tab(self, parent):
+        self.top_frame = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        self.top_frame.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    def _refresh(self):
+        stats = get_dashboard_stats()
+        funnel = get_conversion_funnel()
+        monthly = get_monthly_stats(6)
+        top_clients = get_top_clients(10)
+        
+        # Overview
+        for w in self.overview_frame.winfo_children(): w.destroy()
+        
+        # KPIs principaux
+        kpis = ctk.CTkFrame(self.overview_frame, fg_color="transparent")
+        kpis.pack(fill="x", pady=10)
+        
+        kpi_data = [
+            ("👥", "Clients", stats['total_clients'], KRYSTO_PRIMARY),
+            ("🎯", "Prospects", stats['total_prospects'], "#f39c12"),
+            ("📧", "Newsletter", stats['total_newsletter'], KRYSTO_SECONDARY),
+            ("📦", "Produits", stats['total_products'], "#4ecdc4"),
+            ("💰", "CA Total", format_price(stats['total_revenue']), "#28a745"),
+            ("📊", "CA Mois", format_price(stats['revenue_month']), "#17a2b8"),
+            ("🚫", "Impayés", format_price(stats['total_debt']), "#dc3545"),
+            ("📋", "Tâches", stats['tasks_pending'], "#6c5ce7"),
+        ]
+        
+        for i, (icon, label, value, color) in enumerate(kpi_data):
+            card = ctk.CTkFrame(kpis, fg_color=KRYSTO_DARK, corner_radius=10)
+            card.pack(side="left", fill="both", expand=True, padx=5)
+            ctk.CTkLabel(card, text=icon, font=("Helvetica", 24)).pack(pady=(15, 5))
+            ctk.CTkLabel(card, text=str(value), font=("Helvetica", 18, "bold"), text_color=color).pack()
+            ctk.CTkLabel(card, text=label, text_color="#888", font=("Helvetica", 10)).pack(pady=(0, 15))
+        
+        # Funnel de conversion
+        funnel_frame = ctk.CTkFrame(self.overview_frame, fg_color=KRYSTO_DARK, corner_radius=10)
+        funnel_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(funnel_frame, text="🔄 Funnel de conversion", font=("Helvetica", 14, "bold")).pack(anchor="w", padx=15, pady=10)
+        
+        funnel_bar = ctk.CTkFrame(funnel_frame, fg_color="transparent")
+        funnel_bar.pack(fill="x", padx=15, pady=(0, 15))
+        
+        funnel_items = [
+            ("Prospects", funnel['prospects'], "#f39c12"),
+            ("Clients", funnel['clients'], KRYSTO_PRIMARY),
+            ("Avec devis", funnel['with_quotes'], "#17a2b8"),
+            ("Avec factures", funnel['with_invoices'], "#28a745"),
+            ("Payés", funnel['with_paid'], "#20c997"),
+        ]
+        
+        max_val = max(v for _, v, _ in funnel_items) or 1
+        for label, value, color in funnel_items:
+            row = ctk.CTkFrame(funnel_bar, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(row, text=label, width=100).pack(side="left")
+            bar_width = max(int(300 * value / max_val), 5)
+            ctk.CTkFrame(row, width=bar_width, height=20, fg_color=color, corner_radius=5).pack(side="left", padx=5)
+            ctk.CTkLabel(row, text=str(value), text_color=color, font=("Helvetica", 11, "bold")).pack(side="left", padx=5)
+        
+        # Taux de conversion
+        ctk.CTkLabel(funnel_frame, text=f"Taux de conversion: {stats['conversion_rate']}%", 
+                     text_color=KRYSTO_SECONDARY, font=("Helvetica", 12, "bold")).pack(anchor="w", padx=15, pady=(0, 10))
+        
+        # Clients tab
+        for w in self.clients_frame.winfo_children(): w.destroy()
+        
+        info_frame = ctk.CTkFrame(self.clients_frame, fg_color=KRYSTO_DARK, corner_radius=10)
+        info_frame.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(info_frame, text=f"📈 Nouveaux clients ce mois: {stats['new_clients_month']}", 
+                     font=("Helvetica", 14)).pack(anchor="w", padx=20, pady=10)
+        ctk.CTkLabel(info_frame, text=f"🎯 Prospects en attente: {stats['total_prospects']}", 
+                     font=("Helvetica", 14)).pack(anchor="w", padx=20, pady=5)
+        ctk.CTkLabel(info_frame, text=f"⚠️ Clients avec impayés: {stats['clients_with_debt']}", 
+                     font=("Helvetica", 14)).pack(anchor="w", padx=20, pady=(5, 10))
+        
+        # Graphique mensuel si matplotlib disponible
+        if HAS_MATPLOTLIB and monthly:
+            self._draw_chart(self.clients_frame, monthly, 'new_clients', "Nouveaux clients par mois")
+        
+        # Revenue tab
+        for w in self.revenue_frame.winfo_children(): w.destroy()
+        
+        rev_info = ctk.CTkFrame(self.revenue_frame, fg_color=KRYSTO_DARK, corner_radius=10)
+        rev_info.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(rev_info, text=f"💰 CA Total: {format_price(stats['total_revenue'])}", 
+                     font=("Helvetica", 16, "bold"), text_color="#28a745").pack(anchor="w", padx=20, pady=10)
+        ctk.CTkLabel(rev_info, text=f"📅 CA ce mois: {format_price(stats['revenue_month'])}", 
+                     font=("Helvetica", 14)).pack(anchor="w", padx=20, pady=5)
+        ctk.CTkLabel(rev_info, text=f"📋 Devis en attente: {stats['quotes_pending']}", 
+                     font=("Helvetica", 14)).pack(anchor="w", padx=20, pady=5)
+        ctk.CTkLabel(rev_info, text=f"⏳ Factures impayées: {stats['invoices_unpaid']}", 
+                     font=("Helvetica", 14), text_color="#dc3545").pack(anchor="w", padx=20, pady=(5, 10))
+        
+        if HAS_MATPLOTLIB and monthly:
+            self._draw_chart(self.revenue_frame, monthly, 'revenue', "Revenus par mois (XPF)", is_currency=True)
+        
+        # Top clients tab
+        for w in self.top_frame.winfo_children(): w.destroy()
+        
+        ctk.CTkLabel(self.top_frame, text="🏆 Top 10 Clients (par CA)", font=("Helvetica", 14, "bold")).pack(anchor="w", pady=10)
+        
+        for i, client in enumerate(top_clients, 1):
+            revenue = client['total_revenue'] or 0
+            row = ctk.CTkFrame(self.top_frame, fg_color="#2a2a2a" if i % 2 == 0 else KRYSTO_DARK)
+            row.pack(fill="x", pady=2)
+            
+            medal = "🥇" if i == 1 else ("🥈" if i == 2 else ("🥉" if i == 3 else f"{i}."))
+            ctk.CTkLabel(row, text=medal, font=("Helvetica", 14), width=40).pack(side="left", padx=10, pady=8)
+            ctk.CTkLabel(row, text=client['name'], font=("Helvetica", 12)).pack(side="left", padx=10)
+            ctk.CTkLabel(row, text=f"{client['invoice_count'] or 0} factures", text_color="#888", 
+                         font=("Helvetica", 10)).pack(side="left", padx=10)
+            ctk.CTkLabel(row, text=format_price(revenue), font=("Helvetica", 12, "bold"), 
+                         text_color="#28a745").pack(side="right", padx=20)
+    
+    def _draw_chart(self, parent, data, key, title, is_currency=False):
+        """Dessine un graphique avec matplotlib."""
+        try:
+            fig, ax = plt.subplots(figsize=(8, 3), facecolor='#343434')
+            ax.set_facecolor('#343434')
+            
+            months = [d['month'] for d in data]
+            values = [d[key] for d in data]
+            
+            bars = ax.bar(months, values, color=KRYSTO_PRIMARY)
+            
+            ax.set_title(title, color='white', fontsize=12)
+            ax.tick_params(colors='white')
+            ax.spines['bottom'].set_color('white')
+            ax.spines['left'].set_color('white')
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            
+            for spine in ax.spines.values():
+                spine.set_color('#666')
+            
+            plt.tight_layout()
+            
+            canvas = FigureCanvasTkAgg(fig, parent)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="x", pady=10)
+            
+            plt.close(fig)
+        except Exception as e:
+            ctk.CTkLabel(parent, text=f"Graphique non disponible: {str(e)}", text_color="#888").pack(pady=10)
+
+
+# ============================================================================
+# DEVIS & FACTURES FRAME
+# ============================================================================
+class DevisFacturesFrame(ctk.CTkFrame):
+    def __init__(self, parent):
+        super().__init__(parent, fg_color="transparent")
+        self._create_ui()
+    
+    def _create_ui(self):
+        header = ctk.CTkFrame(self, fg_color=KRYSTO_DARK, corner_radius=10)
+        header.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(header, text="📄 Devis & Factures", font=("Helvetica", 20, "bold")).pack(side="left", padx=20, pady=15)
+        
+        self.tabs = ctk.CTkTabview(self, fg_color=KRYSTO_DARK)
+        self.tabs.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self.tabs.add("📝 Devis")
+        self.tabs.add("🧾 Factures")
+        
+        self._create_quotes_tab(self.tabs.tab("📝 Devis"))
+        self._create_invoices_tab(self.tabs.tab("🧾 Factures"))
+    
+    def _create_quotes_tab(self, parent):
+        toolbar = ctk.CTkFrame(parent, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=10)
+        
+        ctk.CTkButton(toolbar, text="➕ Nouveau devis", fg_color=KRYSTO_PRIMARY,
+                      command=self._new_quote).pack(side="left", padx=5)
+        
+        self.quote_filter = ctk.CTkSegmentedButton(toolbar, values=["Tous", "Brouillon", "Envoyé", "Accepté", "Refusé"],
+                                                    command=lambda v: self._load_quotes())
+        self.quote_filter.pack(side="left", padx=10)
+        self.quote_filter.set("Tous")
+        
+        self.quotes_list = ctk.CTkScrollableFrame(parent, fg_color="#1a1a1a")
+        self.quotes_list.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self._load_quotes()
+    
+    def _create_invoices_tab(self, parent):
+        toolbar = ctk.CTkFrame(parent, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=10)
+        
+        ctk.CTkButton(toolbar, text="➕ Nouvelle facture", fg_color=KRYSTO_PRIMARY,
+                      command=self._new_invoice).pack(side="left", padx=5)
+        
+        self.invoice_filter = ctk.CTkSegmentedButton(toolbar, values=["Tous", "Brouillon", "Envoyée", "Payée", "En retard"],
+                                                      command=lambda v: self._load_invoices())
+        self.invoice_filter.pack(side="left", padx=10)
+        self.invoice_filter.set("Tous")
+        
+        self.invoices_list = ctk.CTkScrollableFrame(parent, fg_color="#1a1a1a")
+        self.invoices_list.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self._load_invoices()
+    
+    def _load_quotes(self):
+        for w in self.quotes_list.winfo_children(): w.destroy()
+        
+        status_filter = self.quote_filter.get().lower()
+        status = status_filter if status_filter != "tous" else None
+        quotes = get_all_quotes(status=status)
+        
+        if not quotes:
+            ctk.CTkLabel(self.quotes_list, text="Aucun devis", text_color="#666").pack(pady=30)
+            return
+        
+        for q in quotes:
+            self._create_quote_row(q)
+    
+    def _create_quote_row(self, quote):
+        status_colors = {'brouillon': '#666', 'envoyé': '#17a2b8', 'accepté': '#28a745', 'refusé': '#dc3545'}
+        
+        frame = ctk.CTkFrame(self.quotes_list, fg_color="#2a2a2a")
+        frame.pack(fill="x", pady=3, padx=5)
+        
+        info = ctk.CTkFrame(frame, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True, padx=15, pady=10)
+        
+        row1 = ctk.CTkFrame(info, fg_color="transparent")
+        row1.pack(fill="x")
+        
+        ctk.CTkLabel(row1, text=quote['number'], font=("Helvetica", 13, "bold")).pack(side="left")
+        status = quote['status'] or 'brouillon'
+        ctk.CTkLabel(row1, text=status.upper(), text_color=status_colors.get(status, '#888'),
+                     font=("Helvetica", 10, "bold")).pack(side="left", padx=10)
+        ctk.CTkLabel(row1, text=quote['client_name'] or "Sans client", text_color="#888").pack(side="left", padx=10)
+        
+        date_q = quote['date_quote'][:10] if quote['date_quote'] else ""
+        ctk.CTkLabel(info, text=f"Date: {date_q} | Total: {format_price(quote['total'] or 0)}", 
+                     text_color="#888", font=("Helvetica", 10)).pack(anchor="w")
+        
+        btns = ctk.CTkFrame(frame, fg_color="transparent")
+        btns.pack(side="right", padx=10)
+        
+        if status == 'brouillon' or status == 'envoyé':
+            ctk.CTkButton(btns, text="✅", width=35, fg_color="#28a745",
+                          command=lambda q=quote: self._convert_to_invoice(q['id'])).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="📄", width=35, fg_color=KRYSTO_PRIMARY,
+                      command=lambda q=quote: self._view_quote_pdf(q['id'])).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="✏️", width=35, fg_color="gray",
+                      command=lambda q=quote: self._edit_quote(q['id'])).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="🗑️", width=35, fg_color="#dc3545",
+                      command=lambda q=quote: self._delete_quote(q['id'])).pack(side="left", padx=2)
+    
+    def _load_invoices(self):
+        for w in self.invoices_list.winfo_children(): w.destroy()
+        
+        status_filter = self.invoice_filter.get().lower()
+        status_map = {'envoyée': 'envoyée', 'payée': 'payée', 'en retard': 'en_retard'}
+        status = status_map.get(status_filter) if status_filter != "tous" and status_filter != "brouillon" else (
+            'brouillon' if status_filter == 'brouillon' else None)
+        invoices = get_all_invoices(status=status)
+        
+        if not invoices:
+            ctk.CTkLabel(self.invoices_list, text="Aucune facture", text_color="#666").pack(pady=30)
+            return
+        
+        for inv in invoices:
+            self._create_invoice_row(inv)
+    
+    def _create_invoice_row(self, invoice):
+        status_colors = {'brouillon': '#666', 'envoyée': '#17a2b8', 'payée': '#28a745', 'en_retard': '#dc3545'}
+        
+        frame = ctk.CTkFrame(self.invoices_list, fg_color="#2a2a2a")
+        frame.pack(fill="x", pady=3, padx=5)
+        
+        info = ctk.CTkFrame(frame, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True, padx=15, pady=10)
+        
+        row1 = ctk.CTkFrame(info, fg_color="transparent")
+        row1.pack(fill="x")
+        
+        ctk.CTkLabel(row1, text=invoice['number'], font=("Helvetica", 13, "bold")).pack(side="left")
+        status = invoice['status'] or 'brouillon'
+        ctk.CTkLabel(row1, text=status.upper(), text_color=status_colors.get(status, '#888'),
+                     font=("Helvetica", 10, "bold")).pack(side="left", padx=10)
+        ctk.CTkLabel(row1, text=invoice['client_name'] or "Sans client", text_color="#888").pack(side="left", padx=10)
+        
+        total = format_price(invoice['total'] or 0)
+        paid = format_price(invoice['amount_paid'] or 0)
+        ctk.CTkLabel(info, text=f"Total: {total} | Payé: {paid}", text_color="#888", font=("Helvetica", 10)).pack(anchor="w")
+        
+        btns = ctk.CTkFrame(frame, fg_color="transparent")
+        btns.pack(side="right", padx=10)
+        
+        if status != 'payée':
+            ctk.CTkButton(btns, text="💰", width=35, fg_color="#28a745",
+                          command=lambda i=invoice: self._mark_paid(i['id'])).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="📄", width=35, fg_color=KRYSTO_PRIMARY,
+                      command=lambda i=invoice: self._view_invoice_pdf(i['id'])).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="✏️", width=35, fg_color="gray",
+                      command=lambda i=invoice: self._edit_invoice(i['id'])).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="🗑️", width=35, fg_color="#dc3545",
+                      command=lambda i=invoice: self._delete_invoice(i['id'])).pack(side="left", padx=2)
+    
+    def _new_quote(self):
+        QuoteEditorDialog(self, on_save=self._load_quotes)
+    
+    def _edit_quote(self, quote_id):
+        QuoteEditorDialog(self, quote_id=quote_id, on_save=self._load_quotes)
+    
+    def _delete_quote(self, quote_id):
+        if messagebox.askyesno("Confirmation", "Supprimer ce devis ?"):
+            delete_quote(quote_id)
+            self._load_quotes()
+    
+    def _convert_to_invoice(self, quote_id):
+        if messagebox.askyesno("Conversion", "Convertir ce devis en facture ?"):
+            invoice_id = convert_quote_to_invoice(quote_id)
+            if invoice_id:
+                messagebox.showinfo("Succès", "Facture créée!")
+                self._load_quotes()
+                self._load_invoices()
+                self.tabs.set("🧾 Factures")
+    
+    def _view_quote_pdf(self, quote_id):
+        generate_quote_pdf(quote_id)
+    
+    def _new_invoice(self):
+        InvoiceEditorDialog(self, on_save=self._load_invoices)
+    
+    def _edit_invoice(self, invoice_id):
+        InvoiceEditorDialog(self, invoice_id=invoice_id, on_save=self._load_invoices)
+    
+    def _delete_invoice(self, invoice_id):
+        if messagebox.askyesno("Confirmation", "Supprimer cette facture ?"):
+            delete_invoice(invoice_id)
+            self._load_invoices()
+    
+    def _mark_paid(self, invoice_id):
+        if messagebox.askyesno("Confirmation", "Marquer cette facture comme payée ?"):
+            mark_invoice_paid(invoice_id)
+            self._load_invoices()
+    
+    def _view_invoice_pdf(self, invoice_id):
+        generate_invoice_pdf(invoice_id)
+
+
+# ============================================================================
+# CRM FRAME - INTERACTIONS & TÂCHES
+# ============================================================================
+class CRMFrame(ctk.CTkFrame):
+    def __init__(self, parent):
+        super().__init__(parent, fg_color="transparent")
+        self._create_ui()
+    
+    def _create_ui(self):
+        header = ctk.CTkFrame(self, fg_color=KRYSTO_DARK, corner_radius=10)
+        header.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(header, text="🎯 CRM", font=("Helvetica", 20, "bold")).pack(side="left", padx=20, pady=15)
+        
+        self.tabs = ctk.CTkTabview(self, fg_color=KRYSTO_DARK)
+        self.tabs.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self.tabs.add("📋 Tâches")
+        self.tabs.add("📞 Interactions")
+        self.tabs.add("⏰ Emails programmés")
+        
+        self._create_tasks_tab(self.tabs.tab("📋 Tâches"))
+        self._create_interactions_tab(self.tabs.tab("📞 Interactions"))
+        self._create_scheduled_tab(self.tabs.tab("⏰ Emails programmés"))
+    
+    def _create_tasks_tab(self, parent):
+        toolbar = ctk.CTkFrame(parent, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=10)
+        
+        ctk.CTkButton(toolbar, text="➕ Nouvelle tâche", fg_color=KRYSTO_PRIMARY,
+                      command=self._new_task).pack(side="left", padx=5)
+        
+        self.task_filter = ctk.CTkSegmentedButton(toolbar, values=["À faire", "En cours", "Toutes"],
+                                                   command=lambda v: self._load_tasks())
+        self.task_filter.pack(side="left", padx=10)
+        self.task_filter.set("À faire")
+        
+        # Tâches urgentes
+        self.urgent_frame = ctk.CTkFrame(parent, fg_color="#4a1a1a", corner_radius=10)
+        self.urgent_frame.pack(fill="x", padx=10, pady=5)
+        
+        self.tasks_list = ctk.CTkScrollableFrame(parent, fg_color="#1a1a1a")
+        self.tasks_list.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self._load_tasks()
+    
+    def _create_interactions_tab(self, parent):
+        toolbar = ctk.CTkFrame(parent, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=10)
+        
+        ctk.CTkButton(toolbar, text="➕ Nouvelle interaction", fg_color=KRYSTO_PRIMARY,
+                      command=self._new_interaction).pack(side="left", padx=5)
+        
+        self.interactions_list = ctk.CTkScrollableFrame(parent, fg_color="#1a1a1a")
+        self.interactions_list.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self._load_interactions()
+    
+    def _create_scheduled_tab(self, parent):
+        toolbar = ctk.CTkFrame(parent, fg_color="transparent")
+        toolbar.pack(fill="x", padx=10, pady=10)
+        
+        ctk.CTkButton(toolbar, text="➕ Programmer un email", fg_color=KRYSTO_PRIMARY,
+                      command=self._new_scheduled).pack(side="left", padx=5)
+        
+        self.scheduled_list = ctk.CTkScrollableFrame(parent, fg_color="#1a1a1a")
+        self.scheduled_list.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self._load_scheduled()
+    
+    def _load_tasks(self):
+        for w in self.tasks_list.winfo_children(): w.destroy()
+        for w in self.urgent_frame.winfo_children(): w.destroy()
+        
+        filter_val = self.task_filter.get()
+        include_completed = filter_val == "Toutes"
+        status = "à faire" if filter_val == "À faire" else ("en_cours" if filter_val == "En cours" else None)
+        
+        tasks = get_all_tasks(status=status, include_completed=include_completed)
+        overdue = get_tasks_due_today()
+        
+        # Tâches urgentes
+        if overdue:
+            ctk.CTkLabel(self.urgent_frame, text=f"⚠️ {len(overdue)} tâche(s) en retard!", 
+                         font=("Helvetica", 12, "bold"), text_color="#dc3545").pack(pady=10)
+        else:
+            self.urgent_frame.pack_forget()
+        
+        if not tasks:
+            ctk.CTkLabel(self.tasks_list, text="Aucune tâche", text_color="#666").pack(pady=30)
+            return
+        
+        for task in tasks:
+            self._create_task_row(task)
+    
+    def _create_task_row(self, task):
+        priority_colors = {'haute': '#dc3545', 'normale': '#17a2b8', 'basse': '#28a745'}
+        
+        frame = ctk.CTkFrame(self.tasks_list, fg_color="#2a2a2a")
+        frame.pack(fill="x", pady=3, padx=5)
+        
+        # Checkbox
+        done = task['status'] == 'terminée'
+        check_var = ctk.BooleanVar(value=done)
+        ctk.CTkCheckBox(frame, text="", variable=check_var, width=30,
+                        command=lambda t=task: self._toggle_task(t['id'], check_var.get())).pack(side="left", padx=10, pady=10)
+        
+        info = ctk.CTkFrame(frame, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True, pady=10)
+        
+        row1 = ctk.CTkFrame(info, fg_color="transparent")
+        row1.pack(fill="x")
+        
+        title_style = ("Helvetica", 12, "overstrike") if done else ("Helvetica", 12)
+        ctk.CTkLabel(row1, text=task['title'], font=title_style).pack(side="left")
+        
+        priority = task['priority'] or 'normale'
+        ctk.CTkLabel(row1, text=priority.upper(), text_color=priority_colors.get(priority, '#888'),
+                     font=("Helvetica", 9, "bold")).pack(side="left", padx=10)
+        
+        if task['client_name']:
+            ctk.CTkLabel(row1, text=f"👤 {task['client_name']}", text_color="#888", font=("Helvetica", 10)).pack(side="left", padx=5)
+        
+        if task['due_date']:
+            due = task['due_date'][:10]
+            is_overdue = task['due_date'] < datetime.now().strftime('%Y-%m-%d') and not done
+            color = "#dc3545" if is_overdue else "#888"
+            ctk.CTkLabel(info, text=f"📅 Échéance: {due}", text_color=color, font=("Helvetica", 10)).pack(anchor="w")
+        
+        btns = ctk.CTkFrame(frame, fg_color="transparent")
+        btns.pack(side="right", padx=10)
+        
+        ctk.CTkButton(btns, text="✏️", width=35, fg_color="gray",
+                      command=lambda t=task: self._edit_task(t['id'])).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="🗑️", width=35, fg_color="#dc3545",
+                      command=lambda t=task: self._delete_task_confirm(t['id'])).pack(side="left", padx=2)
+    
+    def _toggle_task(self, task_id, completed):
+        if completed:
+            complete_task(task_id)
+        else:
+            save_task({'status': 'à faire'}, task_id)
+        self._load_tasks()
+    
+    def _load_interactions(self):
+        for w in self.interactions_list.winfo_children(): w.destroy()
+        
+        interactions = get_all_interactions(limit=50)
+        
+        if not interactions:
+            ctk.CTkLabel(self.interactions_list, text="Aucune interaction", text_color="#666").pack(pady=30)
+            return
+        
+        for inter in interactions:
+            self._create_interaction_row(inter)
+    
+    def _create_interaction_row(self, inter):
+        frame = ctk.CTkFrame(self.interactions_list, fg_color="#2a2a2a")
+        frame.pack(fill="x", pady=3, padx=5)
+        
+        info = ctk.CTkFrame(frame, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True, padx=15, pady=10)
+        
+        row1 = ctk.CTkFrame(info, fg_color="transparent")
+        row1.pack(fill="x")
+        
+        ctk.CTkLabel(row1, text=inter['type'], font=("Helvetica", 12)).pack(side="left")
+        if inter['subject']:
+            ctk.CTkLabel(row1, text=f"- {inter['subject']}", text_color="#888").pack(side="left", padx=5)
+        
+        ctk.CTkLabel(row1, text=f"👤 {inter['client_name'] or 'N/A'}", text_color=KRYSTO_SECONDARY,
+                     font=("Helvetica", 10)).pack(side="right")
+        
+        date_str = inter['date_interaction'][:16] if inter['date_interaction'] else ""
+        ctk.CTkLabel(info, text=date_str, text_color="#666", font=("Helvetica", 9)).pack(anchor="w")
+        
+        btns = ctk.CTkFrame(frame, fg_color="transparent")
+        btns.pack(side="right", padx=10)
+        
+        ctk.CTkButton(btns, text="🗑️", width=35, fg_color="#dc3545",
+                      command=lambda i=inter: self._delete_interaction_confirm(i['id'])).pack(side="left", padx=2)
+    
+    def _load_scheduled(self):
+        for w in self.scheduled_list.winfo_children(): w.destroy()
+        
+        emails = get_scheduled_emails(status='programmé')
+        
+        if not emails:
+            ctk.CTkLabel(self.scheduled_list, text="Aucun email programmé", text_color="#666").pack(pady=30)
+            return
+        
+        for email in emails:
+            self._create_scheduled_row(email)
+    
+    def _create_scheduled_row(self, email):
+        frame = ctk.CTkFrame(self.scheduled_list, fg_color="#2a2a2a")
+        frame.pack(fill="x", pady=3, padx=5)
+        
+        info = ctk.CTkFrame(frame, fg_color="transparent")
+        info.pack(side="left", fill="x", expand=True, padx=15, pady=10)
+        
+        ctk.CTkLabel(info, text=email['subject'], font=("Helvetica", 12)).pack(anchor="w")
+        ctk.CTkLabel(info, text=f"📅 {email['scheduled_date'][:16]}", text_color="#888", 
+                     font=("Helvetica", 10)).pack(anchor="w")
+        
+        btns = ctk.CTkFrame(frame, fg_color="transparent")
+        btns.pack(side="right", padx=10)
+        
+        ctk.CTkButton(btns, text="🗑️", width=35, fg_color="#dc3545",
+                      command=lambda e=email: self._delete_scheduled_confirm(e['id'])).pack(side="left", padx=2)
+    
+    def _new_task(self):
+        TaskEditorDialog(self, on_save=self._load_tasks)
+    
+    def _edit_task(self, task_id):
+        TaskEditorDialog(self, task_id=task_id, on_save=self._load_tasks)
+    
+    def _delete_task_confirm(self, task_id):
+        if messagebox.askyesno("Confirmation", "Supprimer cette tâche ?"):
+            delete_task(task_id)
+            self._load_tasks()
+    
+    def _new_interaction(self):
+        InteractionEditorDialog(self, on_save=self._load_interactions)
+    
+    def _delete_interaction_confirm(self, inter_id):
+        if messagebox.askyesno("Confirmation", "Supprimer cette interaction ?"):
+            delete_interaction(inter_id)
+            self._load_interactions()
+    
+    def _new_scheduled(self):
+        ScheduledEmailDialog(self, on_save=self._load_scheduled)
+    
+    def _delete_scheduled_confirm(self, email_id):
+        if messagebox.askyesno("Confirmation", "Supprimer cet email programmé ?"):
+            delete_scheduled_email(email_id)
+            self._load_scheduled()
+
+
+# ============================================================================
+# DIALOGS POUR CRM, DEVIS, FACTURES
+# ============================================================================
+class TaskEditorDialog(ctk.CTkToplevel):
+    def __init__(self, parent, task_id=None, on_save=None):
+        super().__init__(parent)
+        self.task_id = task_id
+        self.on_save = on_save
+        self.title("Tâche")
+        self.geometry("450x400")
+        self.transient(parent)
+        self.grab_set()
+        self._create_ui()
+        if task_id: self._load_data()
+    
+    def _create_ui(self):
+        main = ctk.CTkScrollableFrame(self)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(main, text="Titre *").pack(anchor="w")
+        self.title_entry = ctk.CTkEntry(main, height=35)
+        self.title_entry.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(main, text="Description").pack(anchor="w")
+        self.desc_entry = ctk.CTkTextbox(main, height=60)
+        self.desc_entry.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(main, text="Client (optionnel)").pack(anchor="w")
+        clients = get_all_clients()
+        client_names = ["Aucun"] + [c['name'] for c in clients]
+        self.client_combo = ctk.CTkComboBox(main, values=client_names, width=300)
+        self.client_combo.pack(anchor="w", pady=(0, 10))
+        self.client_combo.set("Aucun")
+        self._client_map = {c['name']: c['id'] for c in clients}
+        
+        row = ctk.CTkFrame(main, fg_color="transparent")
+        row.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(row, text="Échéance:").pack(side="left")
+        self.due_entry = ctk.CTkEntry(row, width=120, placeholder_text="AAAA-MM-JJ")
+        self.due_entry.pack(side="left", padx=10)
+        
+        ctk.CTkLabel(row, text="Priorité:").pack(side="left", padx=(20, 0))
+        self.priority = ctk.CTkSegmentedButton(row, values=["basse", "normale", "haute"], width=180)
+        self.priority.pack(side="left", padx=10)
+        self.priority.set("normale")
+        
+        btn_frame = ctk.CTkFrame(main, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=20)
+        ctk.CTkButton(btn_frame, text="Annuler", fg_color="gray", command=self.destroy).pack(side="left", expand=True, padx=5)
+        ctk.CTkButton(btn_frame, text="💾 Sauvegarder", fg_color=KRYSTO_PRIMARY, command=self._save).pack(side="left", expand=True, padx=5)
+    
+    def _load_data(self):
+        conn = get_connection()
+        task = conn.execute("SELECT * FROM tasks WHERE id=?", (self.task_id,)).fetchone()
+        conn.close()
+        if not task: return
+        
+        self.title_entry.insert(0, task['title'] or '')
+        self.desc_entry.insert("1.0", task['description'] or '')
+        if task['due_date']: self.due_entry.insert(0, task['due_date'][:10])
+        self.priority.set(task['priority'] or 'normale')
+        
+        if task['client_id']:
+            client = get_client(task['client_id'])
+            if client: self.client_combo.set(client['name'])
+    
+    def _save(self):
+        title = self.title_entry.get().strip()
+        if not title:
+            messagebox.showwarning("Attention", "Le titre est obligatoire")
+            return
+        
+        client_name = self.client_combo.get()
+        client_id = self._client_map.get(client_name) if client_name != "Aucun" else None
+        
+        data = {
+            'title': title,
+            'description': self.desc_entry.get("1.0", "end-1c").strip(),
+            'client_id': client_id,
+            'due_date': self.due_entry.get() or None,
+            'priority': self.priority.get(),
+        }
+        
+        save_task(data, self.task_id)
+        if self.on_save: self.on_save()
+        self.destroy()
+
+
+class InteractionEditorDialog(ctk.CTkToplevel):
+    def __init__(self, parent, on_save=None):
+        super().__init__(parent)
+        self.on_save = on_save
+        self.title("Nouvelle interaction")
+        self.geometry("450x400")
+        self.transient(parent)
+        self.grab_set()
+        self._create_ui()
+    
+    def _create_ui(self):
+        main = ctk.CTkScrollableFrame(self)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(main, text="Client *").pack(anchor="w")
+        clients = get_all_clients()
+        client_names = [c['name'] for c in clients]
+        self.client_combo = ctk.CTkComboBox(main, values=client_names if client_names else [""], width=300)
+        self.client_combo.pack(anchor="w", pady=(0, 10))
+        self._client_map = {c['name']: c['id'] for c in clients}
+        
+        ctk.CTkLabel(main, text="Type *").pack(anchor="w")
+        self.type_combo = ctk.CTkComboBox(main, values=INTERACTION_TYPES, width=200)
+        self.type_combo.pack(anchor="w", pady=(0, 10))
+        self.type_combo.set(INTERACTION_TYPES[0])
+        
+        ctk.CTkLabel(main, text="Sujet").pack(anchor="w")
+        self.subject_entry = ctk.CTkEntry(main, height=35)
+        self.subject_entry.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(main, text="Détails").pack(anchor="w")
+        self.content_entry = ctk.CTkTextbox(main, height=80)
+        self.content_entry.pack(fill="x", pady=(0, 10))
+        
+        btn_frame = ctk.CTkFrame(main, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=20)
+        ctk.CTkButton(btn_frame, text="Annuler", fg_color="gray", command=self.destroy).pack(side="left", expand=True, padx=5)
+        ctk.CTkButton(btn_frame, text="💾 Sauvegarder", fg_color=KRYSTO_PRIMARY, command=self._save).pack(side="left", expand=True, padx=5)
+    
+    def _save(self):
+        client_name = self.client_combo.get()
+        client_id = self._client_map.get(client_name)
+        
+        if not client_id:
+            messagebox.showwarning("Attention", "Sélectionnez un client")
+            return
+        
+        data = {
+            'client_id': client_id,
+            'type': self.type_combo.get(),
+            'subject': self.subject_entry.get().strip(),
+            'content': self.content_entry.get("1.0", "end-1c").strip(),
+        }
+        
+        save_interaction(data)
+        if self.on_save: self.on_save()
+        self.destroy()
+
+
+class ScheduledEmailDialog(ctk.CTkToplevel):
+    def __init__(self, parent, on_save=None):
+        super().__init__(parent)
+        self.on_save = on_save
+        self.title("Programmer un email")
+        self.geometry("500x350")
+        self.transient(parent)
+        self.grab_set()
+        self._create_ui()
+    
+    def _create_ui(self):
+        main = ctk.CTkFrame(self)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        ctk.CTkLabel(main, text="Sujet *").pack(anchor="w")
+        self.subject_entry = ctk.CTkEntry(main, height=35)
+        self.subject_entry.pack(fill="x", pady=(0, 10))
+        
+        ctk.CTkLabel(main, text="Date et heure d'envoi *").pack(anchor="w")
+        row = ctk.CTkFrame(main, fg_color="transparent")
+        row.pack(fill="x", pady=(0, 10))
+        
+        self.date_entry = ctk.CTkEntry(row, width=120, placeholder_text="AAAA-MM-JJ")
+        self.date_entry.pack(side="left")
+        ctk.CTkLabel(row, text="à").pack(side="left", padx=10)
+        self.time_entry = ctk.CTkEntry(row, width=80, placeholder_text="HH:MM")
+        self.time_entry.pack(side="left")
+        self.time_entry.insert(0, "09:00")
+        
+        ctk.CTkLabel(main, text="Destinataires").pack(anchor="w")
+        self.filter_combo = ctk.CTkComboBox(main, values=["Newsletter", "Tous", "Prospects", "Groupe..."], width=200)
+        self.filter_combo.pack(anchor="w", pady=(0, 10))
+        self.filter_combo.set("Newsletter")
+        
+        btn_frame = ctk.CTkFrame(main, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=20)
+        ctk.CTkButton(btn_frame, text="Annuler", fg_color="gray", command=self.destroy).pack(side="left", expand=True, padx=5)
+        ctk.CTkButton(btn_frame, text="📅 Programmer", fg_color=KRYSTO_PRIMARY, command=self._save).pack(side="left", expand=True, padx=5)
+    
+    def _save(self):
+        subject = self.subject_entry.get().strip()
+        date = self.date_entry.get().strip()
+        time = self.time_entry.get().strip()
+        
+        if not subject or not date:
+            messagebox.showwarning("Attention", "Remplissez tous les champs obligatoires")
+            return
+        
+        scheduled_date = f"{date}T{time}:00"
+        
+        data = {
+            'subject': subject,
+            'scheduled_date': scheduled_date,
+            'recipient_filter': self.filter_combo.get(),
+        }
+        
+        save_scheduled_email(data)
+        if self.on_save: self.on_save()
+        self.destroy()
+
+
+class QuoteEditorDialog(ctk.CTkToplevel):
+    def __init__(self, parent, quote_id=None, on_save=None):
+        super().__init__(parent)
+        self.quote_id = quote_id
+        self.on_save = on_save
+        self.lines = []
+        self.title("Devis")
+        self.geometry("800x600")
+        self.transient(parent)
+        self.grab_set()
+        self._create_ui()
+        if quote_id: self._load_data()
+    
+    def _create_ui(self):
+        main = ctk.CTkFrame(self)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Header
+        top = ctk.CTkFrame(main, fg_color="transparent")
+        top.pack(fill="x", pady=(0, 15))
+        
+        ctk.CTkLabel(top, text="Client *").pack(side="left")
+        clients = get_all_clients()
+        client_names = [c['name'] for c in clients]
+        self.client_combo = ctk.CTkComboBox(top, values=client_names if client_names else [""], width=250)
+        self.client_combo.pack(side="left", padx=10)
+        self._client_map = {c['name']: c['id'] for c in clients}
+        
+        ctk.CTkLabel(top, text="TGC:").pack(side="left", padx=(30, 5))
+        self.tgc_combo = ctk.CTkComboBox(top, values=list(TGC_RATES.keys()), width=120)
+        self.tgc_combo.pack(side="left")
+        self.tgc_combo.set(DEFAULT_TGC_RATE)
+        
+        # Lignes
+        ctk.CTkLabel(main, text="Lignes du devis", font=("Helvetica", 12, "bold")).pack(anchor="w")
+        
+        self.lines_frame = ctk.CTkScrollableFrame(main, height=250, fg_color="#1a1a1a")
+        self.lines_frame.pack(fill="x", pady=10)
+        
+        add_btn = ctk.CTkButton(main, text="➕ Ajouter une ligne", fg_color=KRYSTO_SECONDARY, 
+                                 text_color=KRYSTO_DARK, command=self._add_line)
+        add_btn.pack(anchor="w")
+        
+        # Totaux
+        totals = ctk.CTkFrame(main, fg_color=KRYSTO_DARK, corner_radius=10)
+        totals.pack(fill="x", pady=15)
+        
+        self.subtotal_label = ctk.CTkLabel(totals, text="Sous-total: 0 XPF")
+        self.subtotal_label.pack(anchor="e", padx=20, pady=5)
+        self.tgc_label = ctk.CTkLabel(totals, text="TGC (11%): 0 XPF")
+        self.tgc_label.pack(anchor="e", padx=20)
+        self.total_label = ctk.CTkLabel(totals, text="TOTAL: 0 XPF", font=("Helvetica", 14, "bold"))
+        self.total_label.pack(anchor="e", padx=20, pady=5)
+        
+        # Notes
+        ctk.CTkLabel(main, text="Notes").pack(anchor="w")
+        self.notes_entry = ctk.CTkTextbox(main, height=50)
+        self.notes_entry.pack(fill="x", pady=(0, 10))
+        
+        # Buttons
+        btn_frame = ctk.CTkFrame(main, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=10)
+        ctk.CTkButton(btn_frame, text="Annuler", fg_color="gray", command=self.destroy).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="💾 Sauvegarder", fg_color=KRYSTO_PRIMARY, command=self._save).pack(side="right", padx=5)
+        
+        self._add_line()  # Ajouter une ligne par défaut
+    
+    def _add_line(self, description="", quantity=1, unit_price=0, product_id=None):
+        idx = len(self.lines)
+        
+        frame = ctk.CTkFrame(self.lines_frame, fg_color="#2a2a2a")
+        frame.pack(fill="x", pady=2)
+        
+        desc = ctk.CTkEntry(frame, placeholder_text="Description", width=300)
+        desc.pack(side="left", padx=5, pady=5)
+        desc.insert(0, description)
+        
+        qty = ctk.CTkEntry(frame, placeholder_text="Qté", width=60)
+        qty.pack(side="left", padx=5)
+        qty.insert(0, str(quantity))
+        qty.bind("<KeyRelease>", lambda e: self._update_totals())
+        
+        price = ctk.CTkEntry(frame, placeholder_text="Prix unit.", width=100)
+        price.pack(side="left", padx=5)
+        price.insert(0, str(int(unit_price)))
+        price.bind("<KeyRelease>", lambda e: self._update_totals())
+        
+        ctk.CTkButton(frame, text="🗑️", width=30, fg_color="#dc3545",
+                      command=lambda f=frame, i=idx: self._remove_line(f, i)).pack(side="right", padx=5)
+        
+        self.lines.append({'frame': frame, 'desc': desc, 'qty': qty, 'price': price, 'product_id': product_id})
+        self._update_totals()
+    
+    def _remove_line(self, frame, idx):
+        frame.destroy()
+        self.lines = [l for l in self.lines if l['frame'].winfo_exists()]
+        self._update_totals()
+    
+    def _update_totals(self):
+        subtotal = 0
+        for line in self.lines:
+            if not line['frame'].winfo_exists(): continue
+            try:
+                qty = float(line['qty'].get() or 0)
+                price = float(line['price'].get() or 0)
+                subtotal += qty * price
+            except: pass
+        
+        tgc_rate = self.tgc_combo.get()
+        tgc_percent = TGC_RATES.get(tgc_rate, 11)
+        tgc_amount = subtotal * tgc_percent / 100
+        total = subtotal + tgc_amount
+        
+        self.subtotal_label.configure(text=f"Sous-total: {format_price(subtotal)}")
+        self.tgc_label.configure(text=f"TGC ({tgc_percent}%): {format_price(tgc_amount)}")
+        self.total_label.configure(text=f"TOTAL: {format_price(total)}")
+    
+    def _load_data(self):
+        quote, lines = get_quote(self.quote_id)
+        if not quote: return
+        
+        if quote['client_name']:
+            self.client_combo.set(quote['client_name'])
+        self.tgc_combo.set(quote['tgc_rate'] or DEFAULT_TGC_RATE)
+        self.notes_entry.insert("1.0", quote['notes'] or '')
+        
+        # Clear default line and add actual lines
+        for l in self.lines:
+            l['frame'].destroy()
+        self.lines = []
+        
+        for line in lines:
+            self._add_line(line['description'], line['quantity'], line['unit_price'], line['product_id'])
+    
+    def _save(self):
+        client_name = self.client_combo.get()
+        client_id = self._client_map.get(client_name)
+        
+        if not client_id:
+            messagebox.showwarning("Attention", "Sélectionnez un client")
+            return
+        
+        lines_data = []
+        for line in self.lines:
+            if not line['frame'].winfo_exists(): continue
+            desc = line['desc'].get().strip()
+            if not desc: continue
+            
+            try:
+                qty = float(line['qty'].get() or 1)
+                price = float(line['price'].get() or 0)
+            except:
+                qty, price = 1, 0
+            
+            lines_data.append({
+                'description': desc,
+                'quantity': qty,
+                'unit_price': price,
+                'total': qty * price,
+                'product_id': line['product_id'],
+            })
+        
+        if not lines_data:
+            messagebox.showwarning("Attention", "Ajoutez au moins une ligne")
+            return
+        
+        data = {
+            'client_id': client_id,
+            'tgc_rate': self.tgc_combo.get(),
+            'notes': self.notes_entry.get("1.0", "end-1c").strip(),
+            'status': 'brouillon',
+        }
+        
+        save_quote(data, lines_data, self.quote_id)
+        if self.on_save: self.on_save()
+        self.destroy()
+
+
+class InvoiceEditorDialog(QuoteEditorDialog):
+    """Réutilise QuoteEditorDialog avec quelques modifications."""
+    def __init__(self, parent, invoice_id=None, on_save=None):
+        self.invoice_id = invoice_id
+        super().__init__(parent, quote_id=None, on_save=on_save)
+        self.title("Facture")
+    
+    def _load_data(self):
+        if not self.invoice_id: return
+        invoice, lines = get_invoice(self.invoice_id)
+        if not invoice: return
+        
+        if invoice['client_name']:
+            self.client_combo.set(invoice['client_name'])
+        self.tgc_combo.set(invoice['tgc_rate'] or DEFAULT_TGC_RATE)
+        self.notes_entry.insert("1.0", invoice['notes'] or '')
+        
+        for l in self.lines:
+            l['frame'].destroy()
+        self.lines = []
+        
+        for line in lines:
+            self._add_line(line['description'], line['quantity'], line['unit_price'], line['product_id'])
+    
+    def _save(self):
+        client_name = self.client_combo.get()
+        client_id = self._client_map.get(client_name)
+        
+        if not client_id:
+            messagebox.showwarning("Attention", "Sélectionnez un client")
+            return
+        
+        lines_data = []
+        for line in self.lines:
+            if not line['frame'].winfo_exists(): continue
+            desc = line['desc'].get().strip()
+            if not desc: continue
+            
+            try:
+                qty = float(line['qty'].get() or 1)
+                price = float(line['price'].get() or 0)
+            except:
+                qty, price = 1, 0
+            
+            lines_data.append({
+                'description': desc,
+                'quantity': qty,
+                'unit_price': price,
+                'total': qty * price,
+                'product_id': line['product_id'],
+            })
+        
+        if not lines_data:
+            messagebox.showwarning("Attention", "Ajoutez au moins une ligne")
+            return
+        
+        data = {
+            'client_id': client_id,
+            'tgc_rate': self.tgc_combo.get(),
+            'notes': self.notes_entry.get("1.0", "end-1c").strip(),
+            'status': 'brouillon',
+        }
+        
+        save_invoice(data, lines_data, self.invoice_id)
+        if self.on_save: self.on_save()
+        self.destroy()
+
+
+# ============================================================================
+# GÉNÉRATION PDF
+# ============================================================================
+def generate_quote_pdf(quote_id):
+    """Génère le PDF d'un devis."""
+    quote, lines = get_quote(quote_id)
+    if not quote: return
+    
+    if HAS_REPORTLAB:
+        _generate_document_pdf_reportlab(quote, lines, "Devis", quote['number'])
+    else:
+        _generate_document_html(quote, lines, "Devis", quote['number'])
+
+
+def generate_invoice_pdf(invoice_id):
+    """Génère le PDF d'une facture."""
+    invoice, lines = get_invoice(invoice_id)
+    if not invoice: return
+    
+    if HAS_REPORTLAB:
+        _generate_document_pdf_reportlab(invoice, lines, "Facture", invoice['number'])
+    else:
+        _generate_document_html(invoice, lines, "Facture", invoice['number'])
+
+
+def _generate_document_html(doc, lines, doc_type, number):
+    """Génère un document HTML à la place du PDF."""
+    tgc_percent = TGC_RATES.get(doc['tgc_rate'], 11)
+    
+    lines_html = ""
+    for line in lines:
+        lines_html += f"""<tr>
+            <td style="padding:10px;border-bottom:1px solid #ddd;">{line['description']}</td>
+            <td style="padding:10px;border-bottom:1px solid #ddd;text-align:center;">{line['quantity']}</td>
+            <td style="padding:10px;border-bottom:1px solid #ddd;text-align:right;">{format_price(line['unit_price'])}</td>
+            <td style="padding:10px;border-bottom:1px solid #ddd;text-align:right;">{format_price(line['total'])}</td>
+        </tr>"""
+    
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>{doc_type} {number}</title>
+<style>body{{font-family:Arial,sans-serif;margin:40px;}}
+.header{{display:flex;justify-content:space-between;margin-bottom:40px;}}
+.company{{font-size:24px;font-weight:bold;color:{KRYSTO_PRIMARY};}}
+table{{width:100%;border-collapse:collapse;margin:20px 0;}}
+th{{background:{KRYSTO_PRIMARY};color:white;padding:12px;text-align:left;}}
+.totals{{text-align:right;margin-top:20px;}}
+.total{{font-size:20px;font-weight:bold;color:{KRYSTO_PRIMARY};}}</style></head>
+<body>
+<div class="header">
+    <div>
+        <div class="company">{COMPANY_NAME}</div>
+        <div>{COMPANY_ADDRESS}</div>
+        <div>{COMPANY_EMAIL} | {COMPANY_PHONE}</div>
+        {f'<div>RIDET: {COMPANY_RIDET}</div>' if COMPANY_RIDET else ''}
+    </div>
+    <div style="text-align:right;">
+        <h1>{doc_type} {number}</h1>
+        <div>Date: {doc.get('date_quote', doc.get('date_invoice', ''))[:10]}</div>
+    </div>
+</div>
+<div style="margin-bottom:30px;">
+    <strong>Client:</strong><br>
+    {doc['client_name']}<br>
+    {doc.get('client_address', '') or ''}<br>
+    {doc.get('client_email', '') or ''}
+</div>
+<table>
+    <thead><tr><th>Description</th><th style="width:80px;">Qté</th><th style="width:120px;">Prix unit.</th><th style="width:120px;">Total</th></tr></thead>
+    <tbody>{lines_html}</tbody>
+</table>
+<div class="totals">
+    <div>Sous-total: {format_price(doc['subtotal'])}</div>
+    <div>TGC ({tgc_percent}%): {format_price(doc['tgc_amount'])}</div>
+    <div class="total">TOTAL: {format_price(doc['total'])}</div>
+</div>
+{f'<div style="margin-top:30px;"><strong>Notes:</strong><br>{doc["notes"]}</div>' if doc.get('notes') else ''}
+</body></html>"""
+    
+    with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False, encoding='utf-8') as f:
+        f.write(html)
+        webbrowser.open('file://' + f.name)
+
+
+def _generate_document_pdf_reportlab(doc, lines, doc_type, number):
+    """Génère un vrai PDF avec ReportLab."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    
+    filepath = tempfile.mktemp(suffix='.pdf')
+    doc_pdf = SimpleDocTemplate(filepath, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('Title', parent=styles['Heading1'], fontSize=24, textColor=colors.HexColor(KRYSTO_PRIMARY))
+    
+    story = []
+    
+    # Header
+    story.append(Paragraph(f"{COMPANY_NAME}", title_style))
+    story.append(Paragraph(f"{COMPANY_ADDRESS}<br/>{COMPANY_EMAIL} | {COMPANY_PHONE}", styles['Normal']))
+    story.append(Spacer(1, 20))
+    
+    # Document info
+    story.append(Paragraph(f"<b>{doc_type} {number}</b>", styles['Heading2']))
+    story.append(Spacer(1, 10))
+    
+    # Client
+    story.append(Paragraph(f"<b>Client:</b> {doc['client_name']}", styles['Normal']))
+    story.append(Spacer(1, 20))
+    
+    # Table
+    data = [['Description', 'Qté', 'Prix unit.', 'Total']]
+    for line in lines:
+        data.append([line['description'], str(line['quantity']), format_price(line['unit_price']), format_price(line['total'])])
+    
+    table = Table(data, colWidths=[10*cm, 2*cm, 3*cm, 3*cm])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(KRYSTO_PRIMARY)),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 20))
+    
+    # Totals
+    tgc_percent = TGC_RATES.get(doc['tgc_rate'], 11)
+    story.append(Paragraph(f"Sous-total: {format_price(doc['subtotal'])}", styles['Normal']))
+    story.append(Paragraph(f"TGC ({tgc_percent}%): {format_price(doc['tgc_amount'])}", styles['Normal']))
+    story.append(Paragraph(f"<b>TOTAL: {format_price(doc['total'])}</b>", styles['Heading3']))
+    
+    doc_pdf.build(story)
+    webbrowser.open('file://' + filepath)
+
+
+# ============================================================================
 # DASHBOARD
 # ============================================================================
 class DashboardFrame(ctk.CTkFrame):
@@ -9012,67 +11175,141 @@ class DashboardFrame(ctk.CTkFrame):
         self._create_ui()
     
     def _create_ui(self):
+        # Header avec date et bouton refresh
         header = ctk.CTkFrame(self, fg_color=KRYSTO_DARK, corner_radius=10)
         header.pack(fill="x", padx=10, pady=10)
         ctk.CTkLabel(header, text=f"🏭 {COMPANY_NAME}", font=("Helvetica", 22, "bold")).pack(side="left", padx=20, pady=15)
-        ctk.CTkLabel(header, text=datetime.now().strftime("%d/%m/%Y"), text_color="#888").pack(side="right", padx=20)
+        ctk.CTkButton(header, text="🔄 Actualiser", fg_color=KRYSTO_PRIMARY, width=100,
+                      command=self._refresh).pack(side="right", padx=10, pady=10)
+        ctk.CTkLabel(header, text=datetime.now().strftime("%A %d/%m/%Y"), text_color="#888").pack(side="right", padx=10)
         
-        stats_frame = ctk.CTkFrame(self, fg_color="transparent")
-        stats_frame.pack(fill="x", padx=10, pady=10)
+        # Conteneur principal scrollable
+        main_scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        main_scroll.pack(fill="both", expand=True, padx=5, pady=5)
         
-        stats = self._get_stats()
-        for icon, title, val, color in [("👥", "Clients", stats['clients'], KRYSTO_PRIMARY),
-                                         ("📧", "Newsletter", stats['newsletter'], KRYSTO_SECONDARY),
-                                         ("📦", "Produits", stats['products'], "#4ecdc4"),
-                                         ("🏪", "Dépôts", stats['depots'], "#ff6b6b"),
-                                         ("💰", "Impayés Pro", format_price(stats['total_debt']), "#ffc107"),
-                                         ("🚫", "Bloqués", stats['blocked'], "#dc3545")]:
-            card = ctk.CTkFrame(stats_frame, fg_color=KRYSTO_DARK, corner_radius=10)
-            card.pack(side="left", fill="both", expand=True, padx=5)
-            ctk.CTkLabel(card, text=icon, font=("Helvetica", 28)).pack(pady=(15, 5))
-            ctk.CTkLabel(card, text=str(val), font=("Helvetica", 24, "bold"), text_color=color).pack()
-            ctk.CTkLabel(card, text=title, text_color="#888", font=("Helvetica", 11)).pack(pady=(0, 15))
+        # KPIs principaux
+        self.stats_frame = ctk.CTkFrame(main_scroll, fg_color="transparent")
+        self.stats_frame.pack(fill="x", pady=5)
         
-        # Actions manuelles pour les dettes
-        actions_frame = ctk.CTkFrame(self, fg_color=KRYSTO_DARK, corner_radius=10)
-        actions_frame.pack(fill="x", padx=10, pady=10)
+        # Tâches du jour
+        self.tasks_frame = ctk.CTkFrame(main_scroll, fg_color=KRYSTO_DARK, corner_radius=10)
+        self.tasks_frame.pack(fill="x", pady=5, padx=5)
         
-        ctk.CTkLabel(actions_frame, text="⚙️ Actions", font=("Helvetica", 14, "bold")).pack(side="left", padx=20, pady=10)
+        # Actions rapides
+        self.actions_frame = ctk.CTkFrame(main_scroll, fg_color=KRYSTO_DARK, corner_radius=10)
+        self.actions_frame.pack(fill="x", pady=5, padx=5)
         
-        ctk.CTkButton(actions_frame, text="🔄 Rotation dettes", fg_color="gray", width=130,
+        # Deux colonnes : Impayés + Factures récentes
+        bottom = ctk.CTkFrame(main_scroll, fg_color="transparent")
+        bottom.pack(fill="both", expand=True, pady=5)
+        
+        # Colonne gauche - Impayés
+        self.debts_frame = ctk.CTkFrame(bottom, fg_color=KRYSTO_DARK, corner_radius=10)
+        self.debts_frame.pack(side="left", fill="both", expand=True, padx=(5, 2))
+        
+        # Colonne droite - Activité récente
+        self.activity_frame = ctk.CTkFrame(bottom, fg_color=KRYSTO_DARK, corner_radius=10)
+        self.activity_frame.pack(side="right", fill="both", expand=True, padx=(2, 5))
+        
+        self._refresh()
+    
+    def _refresh(self):
+        """Actualise tout le dashboard."""
+        self._load_stats()
+        self._load_tasks()
+        self._load_actions()
+        self._load_debts()
+        self._load_activity()
+    
+    def _load_stats(self):
+        for w in self.stats_frame.winfo_children(): w.destroy()
+        
+        stats = get_dashboard_stats()
+        
+        kpis = [
+            ("👥", "Clients", stats['total_clients'], KRYSTO_PRIMARY),
+            ("🎯", "Prospects", stats['total_prospects'], "#f39c12"),
+            ("📧", "Newsletter", stats['total_newsletter'], KRYSTO_SECONDARY),
+            ("💰", "CA Mois", format_price(stats['revenue_month']), "#28a745"),
+            ("🚫", "Impayés", format_price(stats['total_debt']), "#dc3545"),
+            ("📋", "Tâches", stats['tasks_pending'], "#6c5ce7"),
+        ]
+        
+        for icon, title, val, color in kpis:
+            card = ctk.CTkFrame(self.stats_frame, fg_color=KRYSTO_DARK, corner_radius=10)
+            card.pack(side="left", fill="both", expand=True, padx=3)
+            ctk.CTkLabel(card, text=icon, font=("Helvetica", 24)).pack(pady=(12, 3))
+            ctk.CTkLabel(card, text=str(val), font=("Helvetica", 18, "bold"), text_color=color).pack()
+            ctk.CTkLabel(card, text=title, text_color="#888", font=("Helvetica", 10)).pack(pady=(0, 12))
+    
+    def _load_tasks(self):
+        for w in self.tasks_frame.winfo_children(): w.destroy()
+        
+        tasks = get_tasks_due_today()
+        
+        header = ctk.CTkFrame(self.tasks_frame, fg_color="transparent")
+        header.pack(fill="x", padx=15, pady=10)
+        
+        ctk.CTkLabel(header, text=f"📋 Tâches du jour ({len(tasks)})", font=("Helvetica", 13, "bold")).pack(side="left")
+        
+        if not tasks:
+            ctk.CTkLabel(self.tasks_frame, text="✅ Aucune tâche en retard!", text_color=KRYSTO_SECONDARY).pack(pady=10)
+        else:
+            for task in tasks[:5]:
+                row = ctk.CTkFrame(self.tasks_frame, fg_color="#2a2a2a")
+                row.pack(fill="x", padx=10, pady=2)
+                
+                priority_colors = {'haute': '#dc3545', 'normale': '#17a2b8', 'basse': '#28a745'}
+                priority = task['priority'] or 'normale'
+                
+                ctk.CTkLabel(row, text="•", text_color=priority_colors.get(priority, '#888'), 
+                             font=("Helvetica", 16, "bold")).pack(side="left", padx=(10, 5), pady=6)
+                ctk.CTkLabel(row, text=task['title'][:40], font=("Helvetica", 11)).pack(side="left", pady=6)
+                
+                if task['client_name']:
+                    ctk.CTkLabel(row, text=f"👤 {task['client_name']}", text_color="#888", 
+                                 font=("Helvetica", 9)).pack(side="right", padx=10)
+    
+    def _load_actions(self):
+        for w in self.actions_frame.winfo_children(): w.destroy()
+        
+        ctk.CTkLabel(self.actions_frame, text="⚡ Actions rapides", font=("Helvetica", 13, "bold")).pack(side="left", padx=15, pady=10)
+        
+        ctk.CTkButton(self.actions_frame, text="👤 Nouveau client", fg_color=KRYSTO_PRIMARY, width=130,
+                      command=self._new_client).pack(side="left", padx=5, pady=10)
+        ctk.CTkButton(self.actions_frame, text="📝 Nouveau devis", fg_color=KRYSTO_SECONDARY, text_color=KRYSTO_DARK, width=130,
+                      command=self._new_quote).pack(side="left", padx=5, pady=10)
+        ctk.CTkButton(self.actions_frame, text="📋 Nouvelle tâche", fg_color="#6c5ce7", width=130,
+                      command=self._new_task).pack(side="left", padx=5, pady=10)
+        ctk.CTkButton(self.actions_frame, text="🔄 Rotation dettes", fg_color="gray", width=130,
                       command=self._manual_rotate_debts).pack(side="left", padx=5, pady=10)
-        ctk.CTkButton(actions_frame, text="📧 Envoyer rappels", fg_color=KRYSTO_PRIMARY, width=130,
-                      command=self._manual_send_reminders).pack(side="left", padx=5, pady=10)
         
-        self.action_status = ctk.CTkLabel(actions_frame, text="✅ Tâches auto actives (vérification toutes les 5 min)",
-                                          text_color=KRYSTO_SECONDARY, font=("Helvetica", 10))
-        self.action_status.pack(side="right", padx=20)
+        self.action_status = ctk.CTkLabel(self.actions_frame, text="✅ Auto-tâches actives",
+                                          text_color=KRYSTO_SECONDARY, font=("Helvetica", 9))
+        self.action_status.pack(side="right", padx=15)
+    
+    def _load_debts(self):
+        for w in self.debts_frame.winfo_children(): w.destroy()
         
-        # Clients avec dettes
-        debts_frame = ctk.CTkFrame(self, fg_color=KRYSTO_DARK, corner_radius=10)
-        debts_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        ctk.CTkLabel(debts_frame, text="💰 Clients Pro avec impayés", 
-                     font=("Helvetica", 14, "bold")).pack(anchor="w", padx=20, pady=15)
-        
-        debt_list = ctk.CTkScrollableFrame(debts_frame, fg_color="transparent")
-        debt_list.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        ctk.CTkLabel(self.debts_frame, text="💰 Impayés Pro", 
+                     font=("Helvetica", 13, "bold")).pack(anchor="w", padx=15, pady=10)
         
         clients_debt = get_all_clients(client_type="professionnel", with_debt=True)
+        
         if not clients_debt:
-            ctk.CTkLabel(debt_list, text="Aucun impayé! 🎉", text_color=KRYSTO_SECONDARY).pack(pady=20)
+            ctk.CTkLabel(self.debts_frame, text="🎉 Aucun impayé!", text_color=KRYSTO_SECONDARY).pack(pady=15)
         else:
-            for c in clients_debt[:10]:
-                row = ctk.CTkFrame(debt_list, fg_color="#2a2a2a")
-                row.pack(fill="x", pady=2)
+            for c in clients_debt[:8]:
+                row = ctk.CTkFrame(self.debts_frame, fg_color="#2a2a2a")
+                row.pack(fill="x", padx=10, pady=2)
                 
-                # Indicateur bloqué
                 bloque = c['bloque'] if 'bloque' in c.keys() else 0
-                if bloque:
-                    ctk.CTkLabel(row, text="🚫", font=("Helvetica", 12)).pack(side="left", padx=(10, 5), pady=8)
-                
                 name = c['name'] if 'name' in c.keys() else "?"
-                ctk.CTkLabel(row, text=name, font=("Helvetica", 12)).pack(side="left", padx=10 if not bloque else 0, pady=8)
+                
+                if bloque:
+                    ctk.CTkLabel(row, text="🚫", font=("Helvetica", 10)).pack(side="left", padx=(8, 2), pady=6)
+                
+                ctk.CTkLabel(row, text=name[:20], font=("Helvetica", 11)).pack(side="left", padx=8, pady=6)
                 
                 m1 = c['dette_m1'] if 'dette_m1' in c.keys() else 0
                 m2 = c['dette_m2'] if 'dette_m2' in c.keys() else 0
@@ -9080,91 +11317,53 @@ class DashboardFrame(ctk.CTkFrame):
                 m3p = c['dette_m3plus'] if 'dette_m3plus' in c.keys() else 0
                 total = (m1 or 0) + (m2 or 0) + (m3 or 0) + (m3p or 0)
                 
-                # Récupérer les dates et calculer les jours restants
-                date_m1 = c['date_dette_m1'] if 'date_dette_m1' in c.keys() else None
-                date_m2 = c['date_dette_m2'] if 'date_dette_m2' in c.keys() else None
-                date_m3 = c['date_dette_m3'] if 'date_dette_m3' in c.keys() else None
-                
-                def days_info(date_str, amount):
-                    if not date_str or not amount:
-                        return ""
-                    try:
-                        dt = datetime.fromisoformat(date_str)
-                        days = (datetime.now() - dt).days
-                        remaining = 30 - days
-                        if remaining > 0:
-                            return f"({remaining}j)"
-                        else:
-                            return "(⚠️)"
-                    except:
-                        return ""
-                
-                m1_info = days_info(date_m1, m1)
-                m2_info = days_info(date_m2, m2)
-                m3_info = days_info(date_m3, m3)
-                
-                ctk.CTkLabel(row, text=f"M1: {format_price(m1 or 0)} {m1_info}", text_color="#ffc107" if m1 else "#666",
-                             font=("Helvetica", 10)).pack(side="left", padx=5)
-                ctk.CTkLabel(row, text=f"M2: {format_price(m2 or 0)} {m2_info}", text_color="#ff9800" if m2 else "#666",
-                             font=("Helvetica", 10)).pack(side="left", padx=5)
-                ctk.CTkLabel(row, text=f"M3: {format_price(m3 or 0)} {m3_info}", text_color="#f44336" if m3 else "#666",
-                             font=("Helvetica", 10)).pack(side="left", padx=5)
-                ctk.CTkLabel(row, text=f"M3+: {format_price(m3p or 0)}", text_color="#d32f2f" if m3p else "#666",
-                             font=("Helvetica", 10)).pack(side="left", padx=5)
-                
-                ctk.CTkLabel(row, text=f"Total: {format_price(total)}", text_color="#ff6b6b",
-                             font=("Helvetica", 11, "bold")).pack(side="right", padx=15)
+                color = "#dc3545" if m3p else ("#f39c12" if m3 else "#ffc107")
+                ctk.CTkLabel(row, text=format_price(total), text_color=color,
+                             font=("Helvetica", 11, "bold")).pack(side="right", padx=10)
     
-    def _get_stats(self):
-        conn = get_connection()
-        stats = {'clients': 0, 'newsletter': 0, 'products': 0, 'depots': 0, 'total_debt': 0, 'blocked': 0}
-        try: stats['clients'] = conn.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
-        except: pass
-        try: stats['newsletter'] = conn.execute("SELECT COUNT(*) FROM clients WHERE newsletter=1").fetchone()[0]
-        except: stats['newsletter'] = stats['clients']
-        try: stats['products'] = conn.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
-        except: pass
-        try: stats['depots'] = conn.execute("SELECT COUNT(*) FROM depots WHERE active=1").fetchone()[0]
-        except: pass
-        try:
-            debt = conn.execute("SELECT SUM(COALESCE(dette_m1,0)+COALESCE(dette_m2,0)+COALESCE(dette_m3,0)+COALESCE(dette_m3plus,0)) FROM clients WHERE client_type='professionnel'").fetchone()[0]
-            stats['total_debt'] = debt or 0
-        except: pass
-        try: stats['blocked'] = conn.execute("SELECT COUNT(*) FROM clients WHERE bloque=1").fetchone()[0]
-        except: pass
-        conn.close()
-        return stats
+    def _load_activity(self):
+        for w in self.activity_frame.winfo_children(): w.destroy()
+        
+        ctk.CTkLabel(self.activity_frame, text="📊 Activité récente", 
+                     font=("Helvetica", 13, "bold")).pack(anchor="w", padx=15, pady=10)
+        
+        # Dernières interactions
+        interactions = get_all_interactions(limit=5)
+        
+        if not interactions:
+            ctk.CTkLabel(self.activity_frame, text="Aucune activité récente", text_color="#666").pack(pady=15)
+        else:
+            for inter in interactions:
+                row = ctk.CTkFrame(self.activity_frame, fg_color="#2a2a2a")
+                row.pack(fill="x", padx=10, pady=2)
+                
+                ctk.CTkLabel(row, text=inter['type'][:2], font=("Helvetica", 10)).pack(side="left", padx=8, pady=6)
+                
+                text = f"{inter['client_name'] or 'N/A'}"
+                if inter['subject']:
+                    text += f" - {inter['subject'][:20]}"
+                ctk.CTkLabel(row, text=text, font=("Helvetica", 10)).pack(side="left", pady=6)
+                
+                date_str = inter['date_interaction'][:10] if inter['date_interaction'] else ""
+                ctk.CTkLabel(row, text=date_str, text_color="#666", font=("Helvetica", 9)).pack(side="right", padx=10)
+    
+    def _new_client(self):
+        ClientDialog(self, on_save=self._refresh)
+    
+    def _new_quote(self):
+        QuoteEditorDialog(self, on_save=self._refresh)
+    
+    def _new_task(self):
+        TaskEditorDialog(self, on_save=self._refresh)
     
     def _manual_rotate_debts(self):
         """Déclenche manuellement la rotation des dettes."""
         rotations = rotate_debts()
         if rotations > 0:
-            messagebox.showinfo("Rotation", f"{rotations} rotation(s) effectuée(s).\n\nLes dettes ont été déplacées automatiquement.")
+            messagebox.showinfo("Rotation", f"{rotations} rotation(s) effectuée(s).")
+            self._refresh()
         else:
-            messagebox.showinfo("Rotation", "Aucune dette à faire tourner.\n\n(Les dettes M1 doivent avoir plus de 30 jours)")
-    
-    def _manual_send_reminders(self):
-        """Envoie manuellement les rappels d'impayés."""
-        clients = get_clients_with_debt()
-        if not clients:
-            messagebox.showinfo("Rappels", "Aucun client avec impayé.")
-            return
-        
-        if not messagebox.askyesno("Confirmation", 
-            f"Envoyer des rappels d'impayés à {len(clients)} client(s) pro ?\n\n" +
-            "Les clients bloqués recevront un message indiquant que leur compte est bloqué."):
-            return
-        
-        self.action_status.configure(text="📧 Envoi en cours...", text_color="#ffc107")
-        self.update()
-        
-        def send():
-            results = send_monthly_debt_reminders()
-            self.after(0, lambda: self._on_reminders_sent(results))
-        
-        threading.Thread(target=send, daemon=True).start()
-    
-    def _on_reminders_sent(self, results):
+            messagebox.showinfo("Rotation", "Aucune dette à faire tourner.")
         self.action_status.configure(text="✅ Tâches auto actives", text_color=KRYSTO_SECONDARY)
         msg = f"✅ Envoyés: {results['sent']}"
         if results['errors']:
@@ -9327,15 +11526,20 @@ class ConfigDialog(ctk.CTkToplevel):
 class KrystoApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"{COMPANY_NAME} - v7.0")
-        self.geometry("1300x850")
-        self.minsize(1100, 650)
+        self.title(f"{COMPANY_NAME} - v8.0")
+        self.geometry("1400x900")
+        self.minsize(1200, 700)
         
         init_database()
         self._create_ui()
         
         # Démarrer les tâches automatiques
         self._start_auto_tasks()
+        
+        # Raccourcis clavier
+        self.bind("<Control-n>", lambda e: self._quick_action("new_client"))
+        self.bind("<Control-f>", lambda e: self._show_search())
+        self.bind("<Control-b>", lambda e: self._backup_now())
     
     def _start_auto_tasks(self):
         """Démarre les tâches automatiques en arrière-plan."""
@@ -9354,6 +11558,11 @@ class KrystoApp(ctk.CTk):
                         print("[AUTO] Envoi des rappels mensuels d'impayés...")
                         results = send_monthly_debt_reminders()
                         print(f"[AUTO] Rappels envoyés: {results['sent']}, Erreurs: {len(results['errors'])}")
+                    
+                    # Vérifier les emails programmés
+                    sent = check_and_send_scheduled_emails()
+                    if sent > 0:
+                        print(f"[AUTO] {sent} email(s) programmé(s) envoyé(s)")
                     
                 except Exception as e:
                     print(f"[AUTO] Erreur: {e}")
@@ -9388,29 +11597,49 @@ class KrystoApp(ctk.CTk):
         ctk.CTkLabel(logo, text=COMPANY_NAME, font=("Helvetica", 22, "bold")).pack()
         ctk.CTkLabel(logo, text=COMPANY_SLOGAN, text_color="#888", font=("Helvetica", 9)).pack()
         
-        menu_items = [("🏠", "Tableau de bord", "dashboard"), ("👥", "Clients", "clients"),
-                      ("📦", "Produits", "products"), ("🏪", "Dépôts-Ventes", "depots"), ("📧", "Mailing", "mailing")]
+        # Menu principal avec tous les modules
+        menu_items = [
+            ("🏠", "Tableau de bord", "dashboard"),
+            ("📊", "Statistiques", "stats"),
+            ("👥", "Clients", "clients"),
+            ("📄", "Devis/Factures", "invoices"),
+            ("🎯", "CRM", "crm"),
+            ("📦", "Produits", "products"),
+            ("🏪", "Dépôts-Ventes", "depots"),
+            ("📧", "Mailing", "mailing"),
+        ]
         
         self.menu_buttons = {}
         for icon, label, key in menu_items:
-            btn = ctk.CTkButton(sidebar, text=f"  {icon}  {label}", anchor="w", height=42, fg_color="transparent",
+            btn = ctk.CTkButton(sidebar, text=f"  {icon}  {label}", anchor="w", height=40, fg_color="transparent",
                                 hover_color="#3a3a3a", font=("Helvetica", 12), command=lambda k=key: self._show_frame(k))
             btn.pack(fill="x", padx=10, pady=2)
             self.menu_buttons[key] = btn
         
-        # Bouton configuration en bas
-        config_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
-        config_frame.pack(side="bottom", fill="x", pady=20)
-        ctk.CTkButton(config_frame, text="⚙️ Configuration", anchor="w", height=35, fg_color="transparent",
-                      hover_color="#3a3a3a", font=("Helvetica", 11), command=self._open_config).pack(fill="x", padx=10)
-        ctk.CTkLabel(config_frame, text=f"v7.0", text_color="#555", font=("Helvetica", 9)).pack()
+        # Section utilitaires en bas
+        utils_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
+        utils_frame.pack(side="bottom", fill="x", pady=10)
+        
+        ctk.CTkButton(utils_frame, text="🔍 Recherche", anchor="w", height=32, fg_color="transparent",
+                      hover_color="#3a3a3a", font=("Helvetica", 10), command=self._show_search).pack(fill="x", padx=10, pady=1)
+        ctk.CTkButton(utils_frame, text="💾 Sauvegarde", anchor="w", height=32, fg_color="transparent",
+                      hover_color="#3a3a3a", font=("Helvetica", 10), command=self._backup_now).pack(fill="x", padx=10, pady=1)
+        ctk.CTkButton(utils_frame, text="📥 Import/Export", anchor="w", height=32, fg_color="transparent",
+                      hover_color="#3a3a3a", font=("Helvetica", 10), command=self._show_import_export).pack(fill="x", padx=10, pady=1)
+        ctk.CTkButton(utils_frame, text="⚙️ Configuration", anchor="w", height=32, fg_color="transparent",
+                      hover_color="#3a3a3a", font=("Helvetica", 10), command=self._open_config).pack(fill="x", padx=10, pady=1)
+        
+        ctk.CTkLabel(utils_frame, text=f"v8.0 | Ctrl+F: Recherche", text_color="#555", font=("Helvetica", 8)).pack(pady=5)
         
         self.main_container = ctk.CTkFrame(self, fg_color="#1a1a1a", corner_radius=0)
         self.main_container.pack(side="left", fill="both", expand=True)
         
         self.frames = {
             "dashboard": DashboardFrame(self.main_container),
+            "stats": StatistiquesFrame(self.main_container),
             "clients": ClientsFrame(self.main_container),
+            "invoices": DevisFacturesFrame(self.main_container),
+            "crm": CRMFrame(self.main_container),
             "products": ProductsFrame(self.main_container),
             "depots": DepotsFrame(self.main_container),
             "mailing": MailingFrame(self.main_container),
@@ -9426,6 +11655,185 @@ class KrystoApp(ctk.CTk):
         for k, btn in self.menu_buttons.items():
             btn.configure(fg_color=KRYSTO_PRIMARY if k == key else "transparent")
         self.frames[key].pack(fill="both", expand=True)
+    
+    def _quick_action(self, action):
+        """Actions rapides via raccourcis clavier."""
+        if action == "new_client":
+            self._show_frame("clients")
+            ClientDialog(self, on_save=lambda: self.frames["clients"]._load_clients())
+    
+    def _show_search(self):
+        """Affiche la recherche globale."""
+        SearchDialog(self)
+    
+    def _backup_now(self):
+        """Sauvegarde immédiate."""
+        success, msg = backup_database()
+        if success:
+            messagebox.showinfo("Sauvegarde", msg)
+        else:
+            messagebox.showerror("Erreur", msg)
+    
+    def _show_import_export(self):
+        """Affiche le dialogue import/export."""
+        ImportExportDialog(self)
+
+
+class SearchDialog(ctk.CTkToplevel):
+    """Recherche globale."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("🔍 Recherche globale")
+        self.geometry("600x500")
+        self.transient(parent)
+        self.grab_set()
+        self._create_ui()
+    
+    def _create_ui(self):
+        search_frame = ctk.CTkFrame(self, fg_color="transparent")
+        search_frame.pack(fill="x", padx=20, pady=20)
+        
+        self.search_entry = ctk.CTkEntry(search_frame, placeholder_text="Rechercher clients, produits...", height=40)
+        self.search_entry.pack(side="left", fill="x", expand=True)
+        self.search_entry.bind("<Return>", lambda e: self._search())
+        self.search_entry.bind("<KeyRelease>", lambda e: self._search())
+        
+        ctk.CTkButton(search_frame, text="🔍", width=50, height=40, command=self._search).pack(side="left", padx=5)
+        
+        self.results_frame = ctk.CTkScrollableFrame(self, fg_color="#1a1a1a")
+        self.results_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        self.search_entry.focus()
+    
+    def _search(self):
+        query = self.search_entry.get().strip().lower()
+        for w in self.results_frame.winfo_children(): w.destroy()
+        
+        if len(query) < 2:
+            ctk.CTkLabel(self.results_frame, text="Tapez au moins 2 caractères", text_color="#666").pack(pady=20)
+            return
+        
+        # Recherche clients
+        conn = get_connection()
+        clients = conn.execute("SELECT * FROM clients WHERE LOWER(name) LIKE ? OR LOWER(email) LIKE ? LIMIT 10",
+                               (f"%{query}%", f"%{query}%")).fetchall()
+        
+        # Recherche produits
+        products = conn.execute("SELECT * FROM products WHERE LOWER(name) LIKE ? OR LOWER(description) LIKE ? LIMIT 10",
+                                (f"%{query}%", f"%{query}%")).fetchall()
+        conn.close()
+        
+        if not clients and not products:
+            ctk.CTkLabel(self.results_frame, text="Aucun résultat", text_color="#666").pack(pady=20)
+            return
+        
+        if clients:
+            ctk.CTkLabel(self.results_frame, text="👥 Clients", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=10)
+            for c in clients:
+                frame = ctk.CTkFrame(self.results_frame, fg_color="#2a2a2a")
+                frame.pack(fill="x", pady=2)
+                ctk.CTkLabel(frame, text=f"{c['name']} - {c['email'] or 'Pas d\'email'}", 
+                             font=("Helvetica", 11)).pack(anchor="w", padx=15, pady=8)
+        
+        if products:
+            ctk.CTkLabel(self.results_frame, text="📦 Produits", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=10)
+            for p in products:
+                frame = ctk.CTkFrame(self.results_frame, fg_color="#2a2a2a")
+                frame.pack(fill="x", pady=2)
+                ctk.CTkLabel(frame, text=f"{p['name']} - {format_price(p['price'] or 0)}", 
+                             font=("Helvetica", 11)).pack(anchor="w", padx=15, pady=8)
+
+
+class ImportExportDialog(ctk.CTkToplevel):
+    """Dialogue import/export."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("📥 Import / Export")
+        self.geometry("500x400")
+        self.transient(parent)
+        self.grab_set()
+        self._create_ui()
+    
+    def _create_ui(self):
+        main = ctk.CTkFrame(self)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Export section
+        export_frame = ctk.CTkFrame(main, fg_color=KRYSTO_DARK, corner_radius=10)
+        export_frame.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(export_frame, text="📤 Export", font=("Helvetica", 14, "bold")).pack(anchor="w", padx=15, pady=10)
+        
+        btns = ctk.CTkFrame(export_frame, fg_color="transparent")
+        btns.pack(fill="x", padx=15, pady=(0, 15))
+        
+        ctk.CTkButton(btns, text="👥 Clients CSV", fg_color=KRYSTO_PRIMARY,
+                      command=self._export_clients).pack(side="left", padx=5)
+        ctk.CTkButton(btns, text="📦 Produits CSV", fg_color=KRYSTO_PRIMARY,
+                      command=self._export_products).pack(side="left", padx=5)
+        
+        # Import section
+        import_frame = ctk.CTkFrame(main, fg_color=KRYSTO_DARK, corner_radius=10)
+        import_frame.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(import_frame, text="📥 Import", font=("Helvetica", 14, "bold")).pack(anchor="w", padx=15, pady=10)
+        
+        btns2 = ctk.CTkFrame(import_frame, fg_color="transparent")
+        btns2.pack(fill="x", padx=15, pady=(0, 15))
+        
+        ctk.CTkButton(btns2, text="👥 Clients CSV", fg_color=KRYSTO_SECONDARY, text_color=KRYSTO_DARK,
+                      command=self._import_clients).pack(side="left", padx=5)
+        
+        # Backup section
+        backup_frame = ctk.CTkFrame(main, fg_color=KRYSTO_DARK, corner_radius=10)
+        backup_frame.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(backup_frame, text="💾 Sauvegarde", font=("Helvetica", 14, "bold")).pack(anchor="w", padx=15, pady=10)
+        
+        btns3 = ctk.CTkFrame(backup_frame, fg_color="transparent")
+        btns3.pack(fill="x", padx=15, pady=(0, 15))
+        
+        ctk.CTkButton(btns3, text="💾 Créer sauvegarde", fg_color="#28a745",
+                      command=self._create_backup).pack(side="left", padx=5)
+        ctk.CTkButton(btns3, text="📂 Restaurer", fg_color="#dc3545",
+                      command=self._restore_backup).pack(side="left", padx=5)
+        
+        ctk.CTkButton(main, text="Fermer", fg_color="gray", command=self.destroy).pack(pady=20)
+    
+    def _export_clients(self):
+        filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if filepath:
+            success, msg = export_clients_csv(filepath)
+            messagebox.showinfo("Export", msg) if success else messagebox.showerror("Erreur", msg)
+    
+    def _export_products(self):
+        filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if filepath:
+            success, msg = export_products_csv(filepath)
+            messagebox.showinfo("Export", msg) if success else messagebox.showerror("Erreur", msg)
+    
+    def _import_clients(self):
+        filepath = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
+        if filepath:
+            success, msg = import_clients_csv(filepath)
+            messagebox.showinfo("Import", msg) if success else messagebox.showerror("Erreur", msg)
+    
+    def _create_backup(self):
+        filepath = filedialog.asksaveasfilename(defaultextension=".db", filetypes=[("SQLite", "*.db")])
+        if filepath:
+            success, msg = backup_database(filepath)
+            messagebox.showinfo("Sauvegarde", msg) if success else messagebox.showerror("Erreur", msg)
+    
+    def _restore_backup(self):
+        if not messagebox.askyesno("Attention", "Cette action remplacera toutes les données actuelles. Continuer ?"):
+            return
+        filepath = filedialog.askopenfilename(filetypes=[("SQLite", "*.db")])
+        if filepath:
+            success, msg = restore_database(filepath)
+            if success:
+                messagebox.showinfo("Restauration", msg + "\n\nRedémarrez l'application.")
+            else:
+                messagebox.showerror("Erreur", msg)
 
 
 if __name__ == "__main__":
